@@ -1,0 +1,16 @@
+# requirements.txt — Alarm Insights Dashboard
+# Pin or minimum versions for reproducible Azure deployment
+
+streamlit==1.37.1
+pandas>=2.2.3
+numpy>=1.26.4
+plotly==5.24.1
+python-dotenv==1.0.1
+
+# LLM integration (Azure OpenAI via LangChain OpenAI client)
+langchain-openai==0.3.14
+langchain-experimental==0.3.4
+openai>=1.51.0
+
+# Optional (not required by the app; include if you want)
+matplotlib==3.10.1
