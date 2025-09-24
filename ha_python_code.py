@@ -205,7 +205,11 @@ def calc_metrics(ev_df: pd.DataFrame, trips_df: pd.DataFrame, category: str) -> 
     else:
         dur = pd.Series(0.0, index=counts.index, name="Total Duration (hr)")
 
-    df = pd.concat([counts, trips_unique, dur], axis=1).fillna({"Alarm Trips": 0, "Total Duration (hr)": 0.0}).reset_index()
+    # Combine metrics and reset index
+    df = pd.concat([counts, trips_unique, dur], axis=1).fillna({"Alarm Trips": 0, "Total Duration (hr)": 0.0})
+    df = df.reset_index()
+    df.rename(columns={'index': category}, inplace=True)
+
     trips_nonzero = df["Alarm Trips"].replace({0: pd.NA})
     df["Alarms per Trip"] = (df["Alarm Count"] / trips_nonzero).fillna(0.0)
     dur_nz = df["Total Duration (hr)"].where(df["Total Duration (hr)"] > 0)
@@ -246,7 +250,7 @@ def generate_ai_deep_dive(_llm, alarm_code, w1_metric, delta, driver_perf, bus_p
     def slim(df, keep_cols, n=5):
         if df is None or df.empty:
             return []
-        d = df.reset_index()[keep_cols].copy()
+        d = df[keep_cols].copy()
         for c in d.columns:
             if pd.api.types.is_numeric_dtype(d[c]):
                 d[c] = d[c].round(3)
@@ -524,7 +528,7 @@ def main():
                 total_alarm_trips = driver_perf["Alarm Trips"].sum() if not driver_perf.empty else 0
                 fleet_avg         = (driver_perf["Alarm Count"].sum() / total_alarm_trips) if total_alarm_trips > 0 else 0.0
 
-                ai_md = generate_ai_deep_dive(llm, alarm_choice, w1_metric, delta, driver_perf.reset_index(), bus_perf.reset_index(), svc_perf.reset_index(), fleet_avg)
+                ai_md = generate_ai_deep_dive(llm, alarm_choice, w1_metric, delta, driver_perf, bus_perf, svc_perf, fleet_avg)
                 _ = st.markdown(ai_md or "")
 
     if w1_events.empty:
@@ -534,16 +538,18 @@ def main():
     _ = st.markdown("---")
     _ = st.subheader(f"🔬 Manual Analysis Tables: Week {w1_week}")
     tab1, tab2, tab3 = st.tabs(["**Drivers** 🧑‍✈️", "**Buses** 🚌", "**Services** 🗺️"])
-    cols_show = ["Alarm Count","Alarm Trips","Alarms per Trip","Alarms per Hour","Total Duration (hr)"]
-
+    
     with tab1:
         df_dr = calc_metrics(w1_events, trips_unique, "driver_id")
+        cols_show = ["driver_id", "Alarm Count","Alarm Trips","Alarms per Trip","Alarms per Hour","Total Duration (hr)"]
         _ = st.dataframe(df_dr.sort_values(["Alarms per Trip","Alarm Count"], ascending=[False,False])[cols_show].round(2)) if not df_dr.empty else st.info("No driver events this week.")
     with tab2:
         df_bs = calc_metrics(w1_events, trips_unique, "bus_no")
+        cols_show = ["bus_no", "Alarm Count","Alarm Trips","Alarms per Trip","Alarms per Hour","Total Duration (hr)"]
         _ = st.dataframe(df_bs.sort_values(["Alarms per Trip","Alarm Count"], ascending=[False,False])[cols_show].round(2)) if not df_bs.empty else st.info("No bus events this week.")
     with tab3:
         df_sv = calc_metrics(w1_events, trips_unique, "svc_no")
+        cols_show = ["svc_no", "Alarm Count","Alarm Trips","Alarms per Trip","Alarms per Hour","Total Duration (hr)"]
         _ = st.dataframe(df_sv.sort_values(["Alarms per Trip","Alarm Count"], ascending=[False,False])[cols_show].round(2)) if not df_sv.empty else st.info("No service events this week.")
 
     return None
