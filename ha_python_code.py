@@ -205,7 +205,7 @@ def calc_metrics(ev_df: pd.DataFrame, trips_df: pd.DataFrame, category: str) -> 
     else:
         dur = pd.Series(0.0, index=counts.index, name="Total Duration (hr)")
 
-    df = pd.concat([counts, trips_unique, dur], axis=1).fillna({"Alarm Trips": 0, "Total Duration (hr)": 0.0})
+    df = pd.concat([counts, trips_unique, dur], axis=1).fillna({"Alarm Trips": 0, "Total Duration (hr)": 0.0}).reset_index()
     trips_nonzero = df["Alarm Trips"].replace({0: pd.NA})
     df["Alarms per Trip"] = (df["Alarm Count"] / trips_nonzero).fillna(0.0)
     dur_nz = df["Total Duration (hr)"].where(df["Total Duration (hr)"] > 0)
@@ -429,7 +429,8 @@ def main():
 
     if not depots:
         _ = st.warning("Please select at least one Depot to view the analysis.")
-        return None
+        return
+
     depots_tuple = tuple(depots)
 
     _ = st.title(f"Weekly {ALARM_MAP[alarm_choice]['long']} Review")
@@ -440,7 +441,7 @@ def main():
     )
     if week_map.empty:
         _ = st.info("No events found with the current filters.")
-        return None
+        return
 
     # --- Process chat AFTER data slice so answers use df_alarm ---
     with chat_box:
@@ -464,12 +465,12 @@ def main():
     weekly_sum, total_headcount = per_week_kpis(weekly, headcounts, depots_tuple)
     if total_headcount <= 0 or weekly_sum.empty:
         _ = st.error("Selected depots have zero headcount or no weekly data.")
-        return None
+        return
 
     w1_row = weekly_sum[(weekly_sum["alarm_year"]==w1_year) & (weekly_sum["alarm_week"]==w1_week)]
     if w1_row.empty:
         _ = st.error(f"No data found for Week {w1_week}, {w1_year}.")
-        return None
+        return
 
     w1_metric = float(w1_row["per_bc"].iloc[0])
     w1_events_count = int(w1_row["alarm_sum"].iloc[0])
@@ -516,15 +517,14 @@ def main():
             _ = st.write(f"Rows (events): **{len(w1_events):,}** | Unique trips: **{trips_unique['trip_id_norm'].nunique():,}**")
         if st.button("Generate AI Analysis for Selected Week", type="primary"):
             with st.spinner("Generating insights..."):
-                driver_perf = calc_metrics(w1_events.rename(columns={"driver_id":"driver_id"}),
-                                           trips_unique.rename(columns={"driver_id":"driver_id"}), "driver_id").reset_index()
-                bus_perf    = calc_metrics(w1_events, trips_unique, "bus_no").reset_index()
-                svc_perf    = calc_metrics(w1_events, trips_unique, "svc_no").reset_index()
+                driver_perf = calc_metrics(w1_events, trips_unique, "driver_id")
+                bus_perf    = calc_metrics(w1_events, trips_unique, "bus_no")
+                svc_perf    = calc_metrics(w1_events, trips_unique, "svc_no")
 
                 total_alarm_trips = driver_perf["Alarm Trips"].sum() if not driver_perf.empty else 0
                 fleet_avg         = (driver_perf["Alarm Count"].sum() / total_alarm_trips) if total_alarm_trips > 0 else 0.0
 
-                ai_md = generate_ai_deep_dive(llm, alarm_choice, w1_metric, delta, driver_perf, bus_perf, svc_perf, fleet_avg)
+                ai_md = generate_ai_deep_dive(llm, alarm_choice, w1_metric, delta, driver_perf.reset_index(), bus_perf.reset_index(), svc_perf.reset_index(), fleet_avg)
                 _ = st.markdown(ai_md or "")
 
     if w1_events.empty:
@@ -537,8 +537,7 @@ def main():
     cols_show = ["Alarm Count","Alarm Trips","Alarms per Trip","Alarms per Hour","Total Duration (hr)"]
 
     with tab1:
-        df_dr = calc_metrics(w1_events.rename(columns={"driver_id":"driver_id"}),
-                             trips_unique.rename(columns={"driver_id":"driver_id"}), "driver_id")
+        df_dr = calc_metrics(w1_events, trips_unique, "driver_id")
         _ = st.dataframe(df_dr.sort_values(["Alarms per Trip","Alarm Count"], ascending=[False,False])[cols_show].round(2)) if not df_dr.empty else st.info("No driver events this week.")
     with tab2:
         df_bs = calc_metrics(w1_events, trips_unique, "bus_no")
