@@ -1,4 +1,4 @@
-# app.py — single, fast HA/HB/HC app with a visible sidebar chatbot (ZIP-aware, data1 defaults)
+# app.py — single, fast HA/HB/HC app with a visible sidebar chatbot (data1/ + zip-aware)
 
 import os
 import re
@@ -8,12 +8,11 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 from dotenv import load_dotenv
-from urllib.request import urlopen
 
-# Load .env for local dev; on Azure, values come from App Settings
+# Load .env locally; on Azure, App Settings (env vars) take precedence
 load_dotenv()
 
-APP_VERSION = "v-weekpicker-generic-alarm-2025-09-22-OPT2-chat-zipdata1"
+APP_VERSION = "v-weekpicker-generic-alarm-2025-09-22-OPT2-chat-data1-zip"
 st.set_page_config(page_title="Alarm Insights Dashboard", page_icon="📊", layout="wide")
 
 ALARM_MAP = {
@@ -24,10 +23,7 @@ ALARM_MAP = {
 
 # ---------- config helpers (ENV-first) ----------
 def _cfg(key: str, default: str = "") -> str:
-    """
-    Prefer environment variables (Azure App Service 'Application settings').
-    Fallback to Streamlit secrets or default for local dev.
-    """
+    """Prefer environment variables; fallback to Streamlit secrets or default."""
     val = os.getenv(key, None)
     if val is None:
         try:
@@ -35,6 +31,47 @@ def _cfg(key: str, default: str = "") -> str:
         except Exception:
             val = None
     return (val if val is not None else default).strip()
+
+def smart_read_csv(path: str, *, inner_csv_name: str | None = None, **kwargs) -> pd.DataFrame:
+    """
+    Read CSV from:
+      - local CSV path
+      - local ZIP path containing one CSV (or a specific inner_csv_name)
+    Also supports http(s) raw CSV URLs (no auth).
+    """
+    low_mem = kwargs.pop("low_memory", False)
+    if not path:
+        return pd.DataFrame()
+
+    # HTTP(s) → let pandas handle it directly
+    if path.lower().startswith("http"):
+        return pd.read_csv(path, low_memory=low_mem, **kwargs)
+
+    # Local path
+    if path.lower().endswith(".zip"):
+        # Try to open the ZIP; if not a valid zip, fall back to plain CSV
+        try:
+            with zipfile.ZipFile(path, "r") as zf:
+                members = zf.namelist()
+                # If a specific inner name is requested and exists, use it
+                target = None
+                if inner_csv_name and inner_csv_name in members:
+                    target = inner_csv_name
+                else:
+                    # Otherwise choose the first .csv inside
+                    csvs = [m for m in members if m.lower().endswith(".csv")]
+                    target = csvs[0] if csvs else None
+                if not target:
+                    raise FileNotFoundError("No CSV found inside zip.")
+                with zf.open(target) as f:
+                    # Wrap as text for pandas
+                    return pd.read_csv(io.TextIOWrapper(f, encoding="utf-8"), low_memory=low_mem, **kwargs)
+        except zipfile.BadZipFile:
+            # Not a real zip, try reading as plain CSV (defensive)
+            return pd.read_csv(path, low_memory=low_mem, **kwargs)
+    else:
+        # Regular CSV path
+        return pd.read_csv(path, low_memory=low_mem, **kwargs)
 
 def _maybe_mtime(p: str) -> float:
     """Local files get mtime for cache busting; URLs return 0.0."""
@@ -44,53 +81,6 @@ def _maybe_mtime(p: str) -> float:
         return os.path.getmtime(p)
     except Exception:
         return 0.0
-
-def smart_read_csv(path_or_url: str, **kwargs) -> pd.DataFrame:
-    """
-    Read CSV from:
-      - plain CSV path/URL
-      - .zip path/URL that contains one or more CSV files.
-    Optional: set TELEMATICS_INNER_CSV to the exact CSV path inside the ZIP.
-    Falls back to plain CSV if the file is misnamed as .zip.
-    """
-    if not path_or_url:
-        raise ValueError("Empty path_or_url")
-
-    if not path_or_url.lower().endswith(".zip"):
-        return pd.read_csv(path_or_url, **kwargs)
-
-    try:
-        # open local or remote zip
-        if path_or_url.lower().startswith(("http://", "https://")):
-            with urlopen(path_or_url) as r:
-                data = r.read()
-            zf = zipfile.ZipFile(io.BytesIO(data))
-        else:
-            zf = zipfile.ZipFile(path_or_url)
-
-        with zf:
-            names = zf.namelist()
-            # prefer a designated inner CSV if provided
-            inner_hint = _cfg("TELEMATICS_INNER_CSV", "").strip()
-            csv_candidates = [n for n in names if n.lower().endswith(".csv")]
-
-            inner_name = None
-            if inner_hint:
-                for n in names:
-                    if n == inner_hint or n.lower().endswith(inner_hint.lower()):
-                        inner_name = n
-                        break
-            if inner_name is None:
-                if not csv_candidates:
-                    raise ValueError("ZIP archive does not contain any .csv files")
-                inner_name = csv_candidates[0]  # first CSV in the zip
-
-            with zf.open(inner_name) as f:
-                return pd.read_csv(f, **kwargs)
-
-    except zipfile.BadZipFile:
-        # Not a real zip; try as plain CSV (handles misnamed files)
-        return pd.read_csv(path_or_url, **kwargs)
 
 # ---------- AI (optional) ----------
 try:
@@ -124,15 +114,17 @@ def initialize_llm():
 # ---------- Load & normalize once ----------
 @st.cache_data
 def load_and_process_data(telematics_file, exclusions_file, headcounts_file, file_mtime, _v=APP_VERSION):
-    cols = [
-        "trip_id","trip_departure_datetime","trip_arrival_datetime",
-        "bus_no","depot_id","svc_no","driver_id","alarm_type",
-        "alarm_calendar_date","week_of_year","is_week","is_week_completed"
-    ]
-    df_raw  = smart_read_csv(telematics_file, usecols=lambda c: c in cols or True)
+    # Try to read telematics (zip or csv). If zip, default inner name 'telematics_data.csv'
+    # (change inner_csv_name if your file inside zip has a different name)
+    df_raw  = smart_read_csv(telematics_file, inner_csv_name="telematics_data.csv", usecols=lambda c: True)
     df_excl = smart_read_csv(exclusions_file)
     df_head = smart_read_csv(headcounts_file)
 
+    cols_expect = {
+        "trip_id","trip_departure_datetime","trip_arrival_datetime",
+        "bus_no","depot_id","svc_no","driver_id","alarm_type",
+        "alarm_calendar_date","week_of_year","is_week","is_week_completed"
+    }
     # Normalize text
     for c in ["bus_no","depot_id","svc_no","driver_id","alarm_type"]:
         if c in df_raw.columns:
@@ -145,7 +137,7 @@ def load_and_process_data(telematics_file, exclusions_file, headcounts_file, fil
         df_raw["trip_id"] = None
     df_raw["trip_id_norm"] = df_raw["trip_id"].astype(str).str.strip().str.replace(r"\.0$", "", regex=True)
 
-    # Exclusions
+    # Exclusions (by bus_no)
     excl = set(df_excl["bus_no"].astype(str).str.strip()) if not df_excl.empty else set()
     if "bus_no" in df_raw.columns and excl:
         df_raw = df_raw[~df_raw["bus_no"].astype(str).str.strip().isin(excl)]
@@ -248,16 +240,23 @@ def calc_metrics(ev_df: pd.DataFrame, trips_df: pd.DataFrame, category: str) -> 
         return pd.DataFrame()
 
     counts = ev_df.groupby(category, sort=False).size().rename("Alarm Count")
-    trips_unique = (ev_df[["trip_id_norm", category]].drop_duplicates()
-                    .groupby(category, sort=False)["trip_id_norm"].nunique()
-                    .rename("Alarm Trips"))
+    trips_unique = (
+        ev_df[["trip_id_norm", category]]
+        .drop_duplicates()
+        .groupby(category, sort=False)["trip_id_norm"]
+        .nunique()
+        .rename("Alarm Trips")
+    )
 
     if not trips_df.empty:
         td = trips_df.drop_duplicates(subset=["trip_id_norm"])[[category, "trip_id_norm", "trip_duration_hr"]]
-        dur = (td.groupby(category, sort=False)["trip_duration_hr"].sum()
-               .rename("Total Duration (hr)"))
+        dur = (
+            td.groupby(category, sort=False)["trip_duration_hr"]
+            .sum()
+            .rename("Total Duration (hr)")
+        )
     else:
-        dur = pd.Series(0.0, index=counts.index, name="Total Duration (hr)"))
+        dur = pd.Series(0.0, index=counts.index, name="Total Duration (hr)")
 
     df = pd.concat([counts, trips_unique, dur], axis=1).fillna({"Alarm Trips": 0, "Total Duration (hr)": 0.0})
     trips_nonzero = df["Alarm Trips"].replace({0: pd.NA})
@@ -464,22 +463,17 @@ def main():
         )
         st.markdown("### ⚙️ Filters")
 
-        # Defaults to data1/ for GitHub repo
-        DATA_DIR = _cfg("DATA_DIR", "data1")
-        default_tele = os.path.join(DATA_DIR, "telematics_data.zip")
-        default_excl = os.path.join(DATA_DIR, "vehicle_exclusions.csv")
-        default_head = os.path.join(DATA_DIR, "depot_headcounts.csv")
-
-        tele_file = _cfg("TELEMATICS_URL", _cfg("TELEMATICS_PATH", default_tele))
-        excl_file = _cfg("EXCLUSIONS_URL", _cfg("EXCLUSIONS_PATH", default_excl))
-        head_file = _cfg("HEADCOUNTS_URL", _cfg("HEADCOUNTS_PATH", default_head))
+        # Default to repo paths under data1/
+        tele_file = _cfg("TELEMATICS_PATH", "data1/telematics_data.zip")  # inner file: telematics_data.csv
+        excl_file = _cfg("EXCLUSIONS_PATH", "data1/vehicle_exclusions.csv")
+        head_file = _cfg("HEADCOUNTS_PATH", "data1/depot_headcounts.csv")
 
         file_mtime = max(_maybe_mtime(tele_file), _maybe_mtime(excl_file), _maybe_mtime(head_file))
 
     headcounts, df_raw, weekly_all = load_and_process_data(tele_file, excl_file, head_file, file_mtime)
-    depot_choices = sorted(headcounts["depot_id"].unique())
+    depot_choices = sorted(headcounts["depot_id"].unique()) if not headcounts.empty else []
     with st.sidebar.form("filters_form", clear_on_submit=False):
-        depots = st.multiselect("Depot(s)", depot_choices, default=["WDLAND","KRANJI"])
+        depots = st.multiselect("Depot(s)", depot_choices, default=["WDLAND","KRANJI"] if "WDLAND" in depot_choices else depot_choices[:2])
         only_completed = st.checkbox("Only completed weeks (is_week = 'Y')", value=True)
         exclude_null_driver = st.checkbox("Exclude rows with missing/zero driver_id", value=True)
         _ = st.form_submit_button("✅ Apply Filters")
