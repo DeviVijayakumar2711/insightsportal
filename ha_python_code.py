@@ -1,4 +1,4 @@
-# app.py — single, fast HA/HB/HC app with a visible sidebar chatbot (data1/ + zip-aware)
+# app.py — single, fast HA/HB/HC app with a visible sidebar chatbot (data1/ + robust zip check)
 
 import os
 import re
@@ -9,10 +9,9 @@ import plotly.graph_objects as go
 import streamlit as st
 from dotenv import load_dotenv
 
-# Load .env locally; on Azure, App Settings (env vars) take precedence
 load_dotenv()
 
-APP_VERSION = "v-weekpicker-generic-alarm-2025-09-22-OPT2-chat-data1-zip"
+APP_VERSION = "v-weekpicker-generic-alarm-2025-09-22-OPT2-chat-data1-zipfix"
 st.set_page_config(page_title="Alarm Insights Dashboard", page_icon="📊", layout="wide")
 
 ALARM_MAP = {
@@ -23,7 +22,6 @@ ALARM_MAP = {
 
 # ---------- config helpers (ENV-first) ----------
 def _cfg(key: str, default: str = "") -> str:
-    """Prefer environment variables; fallback to Streamlit secrets or default."""
     val = os.getenv(key, None)
     if val is None:
         try:
@@ -32,50 +30,56 @@ def _cfg(key: str, default: str = "") -> str:
             val = None
     return (val if val is not None else default).strip()
 
+def _is_real_zip(path: str) -> bool:
+    """Quick signature check so we don't attempt to open non-zips."""
+    try:
+        with open(path, "rb") as f:
+            sig = f.read(4)
+        # PK\x03\x04 is normal ZIP; PK\x05\x06 can appear for empty ZIPs
+        return sig.startswith(b"PK")
+    except Exception:
+        return False
+
 def smart_read_csv(path: str, *, inner_csv_name: str | None = None, **kwargs) -> pd.DataFrame:
     """
     Read CSV from:
-      - local CSV path
-      - local ZIP path containing one CSV (or a specific inner_csv_name)
-    Also supports http(s) raw CSV URLs (no auth).
+      - local CSV
+      - local ZIP that contains one CSV (auto-pick or by inner_csv_name)
+      - http(s) CSV (raw)
+    Robust against mis-labeled files (will fall back to CSV if not a real ZIP).
     """
     low_mem = kwargs.pop("low_memory", False)
     if not path:
         return pd.DataFrame()
 
-    # HTTP(s) → let pandas handle it directly
-    if path.lower().startswith("http"):
+    # Remote → let pandas handle
+    if path.lower().startswith(("http://", "https://")):
         return pd.read_csv(path, low_memory=low_mem, **kwargs)
 
     # Local path
-    if path.lower().endswith(".zip"):
-        # Try to open the ZIP; if not a valid zip, fall back to plain CSV
+    if path.lower().endswith(".zip") and _is_real_zip(path):
         try:
             with zipfile.ZipFile(path, "r") as zf:
                 members = zf.namelist()
-                # If a specific inner name is requested and exists, use it
                 target = None
                 if inner_csv_name and inner_csv_name in members:
                     target = inner_csv_name
                 else:
-                    # Otherwise choose the first .csv inside
                     csvs = [m for m in members if m.lower().endswith(".csv")]
                     target = csvs[0] if csvs else None
                 if not target:
-                    raise FileNotFoundError("No CSV found inside zip.")
+                    raise FileNotFoundError("No CSV found inside the ZIP.")
                 with zf.open(target) as f:
-                    # Wrap as text for pandas
                     return pd.read_csv(io.TextIOWrapper(f, encoding="utf-8"), low_memory=low_mem, **kwargs)
-        except zipfile.BadZipFile:
-            # Not a real zip, try reading as plain CSV (defensive)
+        except Exception as e:
+            # If anything goes wrong, try as plain CSV as a last resort
             return pd.read_csv(path, low_memory=low_mem, **kwargs)
     else:
-        # Regular CSV path
+        # Either not .zip or not a real zip → treat as CSV
         return pd.read_csv(path, low_memory=low_mem, **kwargs)
 
 def _maybe_mtime(p: str) -> float:
-    """Local files get mtime for cache busting; URLs return 0.0."""
-    if not p or p.lower().startswith("http"):
+    if not p or p.lower().startswith(("http://", "https://")):
         return 0.0
     try:
         return os.path.getmtime(p)
@@ -94,7 +98,6 @@ def initialize_llm():
     api_key  = _cfg("OPENAI_API_KEY")
     deploy   = _cfg("AZURE_DEPLOYMENT")
     api_ver  = _cfg("AZURE_API_VERSION", "2024-02-15-preview")
-
     if not (endpoint and api_key and deploy) or AzureChatOpenAI is None:
         return None
     try:
@@ -114,17 +117,10 @@ def initialize_llm():
 # ---------- Load & normalize once ----------
 @st.cache_data
 def load_and_process_data(telematics_file, exclusions_file, headcounts_file, file_mtime, _v=APP_VERSION):
-    # Try to read telematics (zip or csv). If zip, default inner name 'telematics_data.csv'
-    # (change inner_csv_name if your file inside zip has a different name)
-    df_raw  = smart_read_csv(telematics_file, inner_csv_name="telematics_data.csv", usecols=lambda c: True)
+    df_raw  = smart_read_csv(telematics_file, inner_csv_name=None, usecols=lambda c: True)
     df_excl = smart_read_csv(exclusions_file)
     df_head = smart_read_csv(headcounts_file)
 
-    cols_expect = {
-        "trip_id","trip_departure_datetime","trip_arrival_datetime",
-        "bus_no","depot_id","svc_no","driver_id","alarm_type",
-        "alarm_calendar_date","week_of_year","is_week","is_week_completed"
-    }
     # Normalize text
     for c in ["bus_no","depot_id","svc_no","driver_id","alarm_type"]:
         if c in df_raw.columns:
@@ -137,7 +133,7 @@ def load_and_process_data(telematics_file, exclusions_file, headcounts_file, fil
         df_raw["trip_id"] = None
     df_raw["trip_id_norm"] = df_raw["trip_id"].astype(str).str.strip().str.replace(r"\.0$", "", regex=True)
 
-    # Exclusions (by bus_no)
+    # Exclusions
     excl = set(df_excl["bus_no"].astype(str).str.strip()) if not df_excl.empty else set()
     if "bus_no" in df_raw.columns and excl:
         df_raw = df_raw[~df_raw["bus_no"].astype(str).str.strip().isin(excl)]
@@ -213,7 +209,7 @@ def slice_by_filters(df_raw: pd.DataFrame, weekly_all: pd.DataFrame,
                     .dropna().drop_duplicates().sort_values(["alarm_year","alarm_week"]))
         week_map["label"] = week_map.apply(lambda r: f"W{int(r['alarm_week'])} · {int(r['alarm_year'])}", axis=1)
 
-    # Weekly agg for this view
+    # Weekly agg
     wk_mask = (weekly_all["alarm_up"] == alarm_choice) & (weekly_all["depot_id_norm"].isin(depots_set))
     weekly = (weekly_all.loc[wk_mask, ["alarm_year","alarm_week","alarm_sum"]]
               .groupby(["alarm_year","alarm_week"], as_index=False)["alarm_sum"].sum())
@@ -341,7 +337,6 @@ Return a 3-row table: Priority | Recommended Action | Data-Driven Rationale.
 
 # ---------- Chatbot helpers ----------
 def _parse_query(q: str):
-    """Return (entity_type, entity_id, n_weeks, specific_week, specific_year)."""
     if not q:
         return None, None, 12, None, None
     ql = q.strip().lower()
@@ -370,14 +365,12 @@ def _parse_query(q: str):
     return None, guess, n_weeks, wk, yr
 
 def vector_week_start(year_series, week_series):
-    """Vectorized ISO week start (Monday) for aligned series."""
     return pd.to_datetime(
         year_series.astype(int).astype(str) + week_series.astype(int).astype(str) + "1",
         format="%G%V%w", errors="coerce"
     )
 
 def answer_entity_question(q: str, alarm_choice: str, df_alarm: pd.DataFrame):
-    """Answer about a driver/bus/svc using the already-filtered df_alarm."""
     etype, eid, n_weeks, wk, yr = _parse_query(q)
     if etype not in {"driver","bus","svc"}:
         return (
@@ -464,9 +457,12 @@ def main():
         st.markdown("### ⚙️ Filters")
 
         # Default to repo paths under data1/
-        tele_file = _cfg("TELEMATICS_PATH", "data1/telematics_data.zip")  # inner file: telematics_data.csv
+        tele_file = _cfg("TELEMATICS_PATH", "data1/telematics_data.zip")
         excl_file = _cfg("EXCLUSIONS_PATH", "data1/vehicle_exclusions.csv")
         head_file = _cfg("HEADCOUNTS_PATH", "data1/depot_headcounts.csv")
+
+        # Tiny debug banner so you can see what was used
+        st.caption(f"Data sources: {tele_file} | {excl_file} | {head_file}")
 
         file_mtime = max(_maybe_mtime(tele_file), _maybe_mtime(excl_file), _maybe_mtime(head_file))
 
