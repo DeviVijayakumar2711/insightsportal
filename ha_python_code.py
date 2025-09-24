@@ -1,9 +1,6 @@
-# app.py — single, fast HA/HB/HC app with a visible sidebar chatbot (data1/ + robust zip check)
-
+# app.py — single, fast HA/HB/HC app with a visible sidebar chatbot (cloud-first)
 import os
 import re
-import io
-import zipfile
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
@@ -11,7 +8,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-APP_VERSION = "v-weekpicker-generic-alarm-2025-09-22-OPT2-chat-data1-zipfix"
+APP_VERSION = "v-weekpicker-generic-alarm-2025-09-22-cloud-first-fix"
 st.set_page_config(page_title="Alarm Insights Dashboard", page_icon="📊", layout="wide")
 
 ALARM_MAP = {
@@ -22,6 +19,10 @@ ALARM_MAP = {
 
 # ---------- config helpers (ENV-first) ----------
 def _cfg(key: str, default: str = "") -> str:
+    """
+    Prioritize environment variables (Azure App Service 'Application settings').
+    Fallback to Streamlit secrets or default for local dev.
+    """
     val = os.getenv(key, None)
     if val is None:
         try:
@@ -30,61 +31,9 @@ def _cfg(key: str, default: str = "") -> str:
             val = None
     return (val if val is not None else default).strip()
 
-def _is_real_zip(path: str) -> bool:
-    """Quick signature check so we don't attempt to open non-zips."""
-    try:
-        with open(path, "rb") as f:
-            sig = f.read(4)
-        # PK\x03\x04 is normal ZIP; PK\x05\x06 can appear for empty ZIPs
-        return sig.startswith(b"PK")
-    except Exception:
-        return False
-
-def smart_read_csv(path: str, *, inner_csv_name: str | None = None, **kwargs) -> pd.DataFrame:
-    """
-    Read CSV from:
-      - local CSV
-      - local ZIP that contains one CSV (auto-pick or by inner_csv_name)
-      - http(s) CSV (raw)
-    Robust against mis-labeled files (will fall back to CSV if not a real ZIP).
-    """
-    low_mem = kwargs.pop("low_memory", False)
-    if not path:
-        return pd.DataFrame()
-
-    # Remote → let pandas handle
-    if path.lower().startswith(("http://", "https://")):
-        return pd.read_csv(path, low_memory=low_mem, **kwargs)
-
-    # Local path
-    if path.lower().endswith(".zip") and _is_real_zip(path):
-        try:
-            with zipfile.ZipFile(path, "r") as zf:
-                members = zf.namelist()
-                target = None
-                if inner_csv_name and inner_csv_name in members:
-                    target = inner_csv_name
-                else:
-                    csvs = [m for m in members if m.lower().endswith(".csv")]
-                    target = csvs[0] if csvs else None
-                if not target:
-                    raise FileNotFoundError("No CSV found inside the ZIP.")
-                with zf.open(target) as f:
-                    return pd.read_csv(io.TextIOWrapper(f, encoding="utf-8"), low_memory=low_mem, **kwargs)
-        except Exception as e:
-            # If anything goes wrong, try as plain CSV as a last resort
-            return pd.read_csv(path, low_memory=low_mem, **kwargs)
-    else:
-        # Either not .zip or not a real zip → treat as CSV
-        return pd.read_csv(path, low_memory=low_mem, **kwargs)
-
 def _maybe_mtime(p: str) -> float:
-    if not p or p.lower().startswith(("http://", "https://")):
-        return 0.0
-    try:
-        return os.path.getmtime(p)
-    except Exception:
-        return 0.0
+    """Local files get mtime for cache busting; URLs return 0.0."""
+    return 0.0
 
 # ---------- AI (optional) ----------
 try:
@@ -98,6 +47,7 @@ def initialize_llm():
     api_key  = _cfg("OPENAI_API_KEY")
     deploy   = _cfg("AZURE_DEPLOYMENT")
     api_ver  = _cfg("AZURE_API_VERSION", "2024-02-15-preview")
+
     if not (endpoint and api_key and deploy) or AzureChatOpenAI is None:
         return None
     try:
@@ -117,9 +67,10 @@ def initialize_llm():
 # ---------- Load & normalize once ----------
 @st.cache_data
 def load_and_process_data(telematics_file, exclusions_file, headcounts_file, file_mtime, _v=APP_VERSION):
-    df_raw  = smart_read_csv(telematics_file, inner_csv_name=None, usecols=lambda c: True)
-    df_excl = smart_read_csv(exclusions_file)
-    df_head = smart_read_csv(headcounts_file)
+    # Use pandas' native support for reading from URLs or local paths
+    df_raw = pd.read_csv(telematics_file)
+    df_excl = pd.read_csv(exclusions_file)
+    df_head = pd.read_csv(headcounts_file)
 
     # Normalize text
     for c in ["bus_no","depot_id","svc_no","driver_id","alarm_type"]:
@@ -307,11 +258,11 @@ def generate_ai_deep_dive(_llm, alarm_code, w1_metric, delta, driver_perf, bus_p
         "delta_vs_prev_week": round(float(delta), 3) if delta is not None else None,
         "fleet_avg_per_trip": round(float(fleet_avg_per_trip), 3) if fleet_avg_per_trip is not None else None,
         "top_drivers_by_per_trip": slim(driver_perf.sort_values("Alarms per Trip", ascending=False),
-                                        ["driver_id","Alarms per Trip","Alarm Count","Alarm Trips"]),
-        "top_buses_by_per_trip":   slim(bus_perf.sort_values("Alarms per Trip",   ascending=False),
-                                        ["bus_no","Alarms per Trip","Alarm Count","Alarm Trips"]),
-        "top_services_by_per_trip":slim(svc_perf.sort_values("Alarms per Trip",   ascending=False),
-                                        ["svc_no","Alarms per Trip","Alarm Count","Alarm Trips"]),
+                                         ["driver_id","Alarms per Trip","Alarm Count","Alarm Trips"]),
+        "top_buses_by_per_trip":    slim(bus_perf.sort_values("Alarms per Trip",   ascending=False),
+                                         ["bus_no","Alarms per Trip","Alarm Count","Alarm Trips"]),
+        "top_services_by_per_trip": slim(svc_perf.sort_values("Alarms per Trip",   ascending=False),
+                                         ["svc_no","Alarms per Trip","Alarm Count","Alarm Trips"]),
     }
     try:
         return _llm.predict(
@@ -397,7 +348,7 @@ def answer_entity_question(q: str, alarm_choice: str, df_alarm: pd.DataFrame):
             return f"No events for **{etype} {eid}** in **W{wk} {yr}**.", pd.DataFrame()
 
     weekly = (subset.groupby(["alarm_year","alarm_week"], as_index=False)
-                    .size().rename(columns={"size":"Events"}))
+                     .size().rename(columns={"size":"Events"}))
     weekly["start_of_week"] = vector_week_start(weekly["alarm_year"], weekly["alarm_week"])
     weekly = weekly.sort_values("start_of_week")
 
@@ -456,14 +407,16 @@ def main():
         )
         st.markdown("### ⚙️ Filters")
 
-        # Default to repo paths under data1/
-        tele_file = _cfg("TELEMATICS_PATH", "data1/telematics_data.zip")
-        excl_file = _cfg("EXCLUSIONS_PATH", "data1/vehicle_exclusions.csv")
-        head_file = _cfg("HEADCOUNTS_PATH", "data1/depot_headcounts.csv")
+        # Get data sources from environment variables (cloud-first)
+        tele_file = _cfg("TELEMATICS_URL") or _cfg("TELEMATICS_PATH")
+        excl_file = _cfg("EXCLUSIONS_URL") or _cfg("EXCLUSIONS_PATH")
+        head_file = _cfg("HEADCOUNTS_URL") or _cfg("HEADCOUNTS_PATH")
 
-        # Tiny debug banner so you can see what was used
+        if not tele_file or not excl_file or not head_file:
+            st.error("Data file paths are not configured. Please set TELEMATICS_URL/PATH, EXCLUSIONS_URL/PATH, and HEADCOUNTS_URL/PATH in your environment variables.")
+            return
+
         st.caption(f"Data sources: {tele_file} | {excl_file} | {head_file}")
-
         file_mtime = max(_maybe_mtime(tele_file), _maybe_mtime(excl_file), _maybe_mtime(head_file))
 
     headcounts, df_raw, weekly_all = load_and_process_data(tele_file, excl_file, head_file, file_mtime)
