@@ -1,6 +1,10 @@
-# app.py — single, fast HA/HB/HC app with a visible sidebar chatbot (Azure ENV-first)
+# app.py — single, fast HA/HB/HC app with a visible sidebar chatbot (reads from ./data1 by default)
+
 import os
 import re
+import zipfile
+from io import BytesIO
+
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
@@ -9,7 +13,7 @@ from dotenv import load_dotenv
 # Load .env for local dev; on Azure App Service, env vars come from App Settings
 load_dotenv()
 
-APP_VERSION = "v-weekpicker-generic-alarm-2025-09-22-OPT2-chat-azureenv"
+APP_VERSION = "v-weekpicker-generic-alarm-2025-09-22-OPT2-chat-data1"
 st.set_page_config(page_title="Alarm Insights Dashboard", page_icon="📊", layout="wide")
 
 ALARM_MAP = {
@@ -18,22 +22,45 @@ ALARM_MAP = {
     "HC": {"long": "Harsh Cornering",    "short": "HC"},
 }
 
-# ---------- config helpers (Azure ENV-first) ----------
+# ---------- config helpers (ENV-first, fallback to ./data1) ----------
 def _cfg(key: str, default: str = "") -> str:
-    """
-    Prefer environment variables (Azure App Service 'Application settings').
-    Fallback to Streamlit secrets or default for local dev.
-    """
+    """Prefer OS env vars (Azure App Settings). Fallback to st.secrets/default."""
     val = os.getenv(key, None)
     if val is None:
         try:
-            val = st.secrets.get(key)  # available on Streamlit Cloud/local only
+            val = st.secrets.get(key)
         except Exception:
             val = None
     return (val if val is not None else default).strip()
 
-def smart_read_csv(path_or_url: str, **kwargs) -> pd.DataFrame:
-    """Read CSV from local path or HTTPS/Azure Blob SAS URL."""
+def smart_read_table(path_or_url: str, **kwargs) -> pd.DataFrame:
+    """
+    Read CSV/CSV.GZ or local ZIP (first CSV inside).
+    Also works with HTTPS URLs for CSV/CSV.GZ passed through to pandas.
+    """
+    if not path_or_url:
+        raise ValueError("Empty data path/URL")
+
+    low = path_or_url.lower()
+
+    # Local ZIP: pick first CSV inside
+    if low.endswith(".zip") and not low.startswith("http"):
+        with zipfile.ZipFile(path_or_url) as zf:
+            names = zf.namelist()
+            inner_csv = next((n for n in names if n.lower().endswith(".csv")), None)
+            if inner_csv is None:
+                raise ValueError(f"No .csv found inside {path_or_url}")
+            with zf.open(inner_csv) as f:
+                return pd.read_csv(f, **kwargs)
+
+    # Parquet support (optional) if you later add .parquet files
+    if low.endswith((".parquet", ".parq", ".pq")):
+        try:
+            return pd.read_parquet(path_or_url)
+        except Exception as e:
+            raise RuntimeError(f"Failed to read parquet {path_or_url}: {e}")
+
+    # CSV/CSV.GZ/remote CSV
     return pd.read_csv(path_or_url, **kwargs)
 
 def _maybe_mtime(p: str) -> float:
@@ -58,7 +85,6 @@ def initialize_llm():
     deploy   = _cfg("AZURE_DEPLOYMENT")
     api_ver  = _cfg("AZURE_API_VERSION", "2024-02-15-preview")
 
-    # If any are missing, return None so the app runs without AI
     if not (endpoint and api_key and deploy) or AzureChatOpenAI is None:
         return None
     try:
@@ -83,9 +109,9 @@ def load_and_process_data(telematics_file, exclusions_file, headcounts_file, fil
         "bus_no","depot_id","svc_no","driver_id","alarm_type",
         "alarm_calendar_date","week_of_year","is_week","is_week_completed"
     ]
-    df_raw  = smart_read_csv(telematics_file, usecols=lambda c: c in cols or True)
-    df_excl = smart_read_csv(exclusions_file)
-    df_head = smart_read_csv(headcounts_file)
+    df_raw  = smart_read_table(telematics_file, usecols=lambda c: c in cols or True)
+    df_excl = smart_read_table(exclusions_file)
+    df_head = smart_read_table(headcounts_file)
 
     # Normalize text
     for c in ["bus_no","depot_id","svc_no","driver_id","alarm_type"]:
@@ -300,17 +326,14 @@ def _parse_query(q: str):
     if not q:
         return None, None, 12, None, None
     ql = q.strip().lower()
-
     m = re.search(r"last\s+(\d+)\s*weeks?", ql)
     n_weeks = int(m.group(1)) if m else 12
     n_weeks = max(1, min(n_weeks, 52))
-
     wk = None; yr = None
     m = re.search(r"(?:^|\b)w(?:eek)?\s*[-_ ]?(\d{1,2})(?:\D|$)", ql)
     if m: wk = int(m.group(1))
     m2 = re.search(r"\b(20\d{2})\b", ql)
     if m2: yr = int(m2.group(1))
-
     for pat, etype in [
         (r"(?:driver|bc|captain)\s*#?\s*([a-z0-9._-]+)", "driver"),
         (r"(?:bus|vehicle)\s*#?\s*([a-z0-9._-]+)", "bus"),
@@ -319,37 +342,29 @@ def _parse_query(q: str):
         m = re.search(pat, ql)
         if m:
             return etype, m.group(1).upper(), n_weeks, wk, yr
-
     m = re.search(r"\b([a-z0-9._-]+)\b", ql)
     guess = m.group(1).upper() if m else None
     return None, guess, n_weeks, wk, yr
 
 def vector_week_start(year_series, week_series):
-    """Vectorized ISO week start (Monday) for aligned series."""
     return pd.to_datetime(
         year_series.astype(int).astype(str) + week_series.astype(int).astype(str) + "1",
         format="%G%V%w", errors="coerce"
     )
 
 def answer_entity_question(q: str, alarm_choice: str, df_alarm: pd.DataFrame):
-    """Answer about a driver/bus/svc using the already-filtered df_alarm."""
     etype, eid, n_weeks, wk, yr = _parse_query(q)
     if etype not in {"driver","bus","svc"}:
-        return (
-            "I couldn’t find a specific entity. Try:\n"
-            "- `driver 30450 last 4 weeks`\n"
-            "- `bus 123 W35 2025`\n"
-            "- `svc 973 last 8 weeks`"
-        ), pd.DataFrame()
-
+        return ("I couldn’t find a specific entity. Try:\n"
+                "- `driver 30450 last 4 weeks`\n"
+                "- `bus 123 W35 2025`\n"
+                "- `svc 973 last 8 weeks`"), pd.DataFrame()
     col_map = {"driver": "driver_id", "bus": "bus_no", "svc": "svc_no"}
     col = col_map[etype]
     subset = df_alarm[df_alarm[col].astype(str).str.upper() == str(eid).upper()].copy()
     if subset.empty:
         return f"No {ALARM_MAP[alarm_choice]['short']} events found for **{etype} {eid}** with current filters.", pd.DataFrame()
-
     subset["start_of_week"] = vector_week_start(subset["alarm_year"], subset["alarm_week"])
-
     if wk is not None:
         if yr is None:
             yr = int(pd.to_numeric(subset["alarm_year"], errors="coerce").dropna().max())
@@ -357,29 +372,24 @@ def answer_entity_question(q: str, alarm_choice: str, df_alarm: pd.DataFrame):
         subset = subset[subset["start_of_week"] == sow]
         if subset.empty:
             return f"No events for **{etype} {eid}** in **W{wk} {yr}**.", pd.DataFrame()
-
     weekly = (subset.groupby(["alarm_year","alarm_week"], as_index=False)
                     .size().rename(columns={"size":"Events"}))
     weekly["start_of_week"] = vector_week_start(weekly["alarm_year"], weekly["alarm_week"])
     weekly = weekly.sort_values("start_of_week")
-
     weekly_window = weekly.tail(n_weeks).copy()
     weekly_window["Week"] = "W" + weekly_window["alarm_week"].astype(int).astype(str) + " · " + weekly_window["alarm_year"].astype(int).astype(str)
     weekly_window = weekly_window[["Week","Events"]]
-
     trips_unique = subset.drop_duplicates(subset=["trip_id_norm"])
     total_events = int(len(subset))
     total_trips = int(trips_unique["trip_id_norm"].nunique())
     total_hours = float(trips_unique["trip_duration_hr"].sum())
     per_trip = (total_events / total_trips) if total_trips > 0 else 0.0
     per_hour = (total_events / total_hours) if total_hours > 0 else 0.0
-
     peak_row = weekly.sort_values("Events", ascending=False).head(1)
     peak_txt = ""
     if not peak_row.empty:
         pw = int(peak_row["alarm_week"].iloc[0]); py = int(peak_row["alarm_year"].iloc[0]); pc = int(peak_row["Events"].iloc[0])
         peak_txt = f" Peak: **W{pw} {py}** with **{pc}** events."
-
     answer = (
         f"**{ALARM_MAP[alarm_choice]['short']}** for **{etype} {eid}** (current depots/filters):\n"
         f"- Total events: **{total_events}** across **{total_trips}** trips\n"
@@ -418,10 +428,10 @@ def main():
         )
         st.markdown("### ⚙️ Filters")
 
-        # Data sources via ENV (Azure) or local fallback
-        tele_file = _cfg("TELEMATICS_URL", _cfg("TELEMATICS_PATH", "telematics_new_data_2207.csv"))
-        excl_file = _cfg("EXCLUSIONS_URL", _cfg("EXCLUSIONS_PATH", "vehicle_exclusions.csv"))
-        head_file = _cfg("HEADCOUNTS_URL", _cfg("HEADCOUNTS_PATH", "depot_headcounts.csv"))
+        # DEFAULTS: use repo ./data1 paths; can override via App Settings
+        tele_file = _cfg("TELEMATICS_URL", _cfg("TELEMATICS_PATH", "data1/telematics_data.zip"))
+        excl_file = _cfg("EXCLUSIONS_URL", _cfg("EXCLUSIONS_PATH", "data1/vehicle_exclusions.csv"))
+        head_file = _cfg("HEADCOUNTS_URL", _cfg("HEADCOUNTS_PATH", "data1/depot_headcounts.csv"))
 
         file_mtime = max(_maybe_mtime(tele_file), _maybe_mtime(excl_file), _maybe_mtime(head_file))
 
@@ -453,7 +463,6 @@ def main():
         if pending_q:
             ans, tbl = answer_entity_question(pending_q, alarm_choice, df_alarm)
             st.session_state.qa.append({"q": pending_q, "a": ans, "df": tbl})
-
         for item in st.session_state.qa[-4:]:
             st.markdown(f"**You:** {item['q']}")
             st.markdown(item["a"])
@@ -482,4 +491,78 @@ def main():
     w1_sow = pd.to_datetime(f"{w1_year}{w1_week}1", format="%G%V%w")
     w2_sow = w1_sow - pd.Timedelta(weeks=1)
     w2_year, w2_week = int(w2_sow.isocalendar().year), int(w2_sow.isocalendar().week)
-    w2_row = weekly_sum[(weekly_sum["alarm_year"]=_]()_]()
+    w2_row = weekly_sum[(weekly_sum["alarm_year"]==w2_year) & (weekly_sum["alarm_week"]==w2_week)]
+    if not w2_row.empty:
+        delta = w1_metric - float(w2_row["per_bc"].iloc[0]); delta_text = f"{delta:.2f} vs. W{w2_week}"
+        w2_events_count = int(w2_row["alarm_sum"].iloc[0])
+    else:
+        delta = 0.0; delta_text = "No prior week data"; w2_events_count = 0
+
+    _ = st.markdown(f"## 📈 Performance Snapshot: Week {w1_week}, {w1_year}")
+    c1, c2 = st.columns(2)
+    _ = c1.metric(f"Avg {ALARM_MAP[alarm_choice]['short']} per BC (W{w1_week})", f"{w1_metric:.2f}", delta=delta_text, delta_color="inverse")
+    _ = c2.metric(f"Total {ALARM_MAP[alarm_choice]['short']} Incidents", f"{w1_events_count:,.0f}",
+                  delta=f"{(w1_events_count - w2_events_count):,.0f}")
+
+    weekly_sum["week_label"] = weekly_sum["start_of_week"].dt.strftime("%d %b") + "<br>W" + weekly_sum["alarm_week"].astype(int).astype(str)
+    chart_data = weekly_sum[weekly_sum["start_of_week"] <= w1_sow].tail(12)
+    _ = st.plotly_chart(trend_chart(chart_data, "per_bc", f"Avg {ALARM_MAP[alarm_choice]['short']} per Bus Captain"), use_container_width=True)
+
+    # ===== Current-week slices =====
+    if df_alarm.empty:
+        w1_events = pd.DataFrame(columns=["trip_id_norm","driver_id","bus_no","svc_no","trip_duration_hr"])
+        trips_unique = pd.DataFrame(columns=["trip_id_norm","driver_id","bus_no","svc_no","trip_duration_hr"])
+    else:
+        w1_events = df_alarm.loc[
+            (df_alarm["alarm_year"]==w1_year) & (df_alarm["alarm_week"]==w1_week),
+            ["trip_id_norm","driver_id","bus_no","svc_no","trip_duration_hr"]
+        ]
+        trips_unique = w1_events.drop_duplicates(subset=["trip_id_norm"])
+
+    # ----- AI Deep Dive -----
+    _ = st.markdown("---")
+    _ = st.subheader("🤖 AI-Powered Deep Dive")
+    if llm is None:
+        _ = st.info("AI model is not configured.")
+    elif w1_events.empty:
+        _ = st.info(f"No {ALARM_MAP[alarm_choice]['short']} rows for the selected week.")
+    else:
+        with st.expander("Context for AI (counts)", expanded=False):
+            _ = st.write(f"Rows (events): **{len(w1_events):,}** | Unique trips: **{trips_unique['trip_id_norm'].nunique():,}**")
+        if st.button("Generate AI Analysis for Selected Week", type="primary"):
+            with st.spinner("Generating insights..."):
+                driver_perf = calc_metrics(w1_events.rename(columns={"driver_id":"driver_id"}),
+                                           trips_unique.rename(columns={"driver_id":"driver_id"}), "driver_id").reset_index()
+                bus_perf    = calc_metrics(w1_events, trips_unique, "bus_no").reset_index()
+                svc_perf    = calc_metrics(w1_events, trips_unique, "svc_no").reset_index()
+
+                total_alarm_trips = driver_perf["Alarm Trips"].sum() if not driver_perf.empty else 0
+                fleet_avg         = (driver_perf["Alarm Count"].sum() / total_alarm_trips) if total_alarm_trips > 0 else 0.0
+
+                ai_md = generate_ai_deep_dive(llm, alarm_choice, w1_metric, delta, driver_perf, bus_perf, svc_perf, fleet_avg)
+                _ = st.markdown(ai_md or "")
+
+    if w1_events.empty:
+        _ = st.caption("Note: No matching event rows found. Tables will be empty.")
+
+    # ----- Manual Tables -----
+    _ = st.markdown("---")
+    _ = st.subheader(f"🔬 Manual Analysis Tables: Week {w1_week}")
+    tab1, tab2, tab3 = st.tabs(["**Drivers** 🧑‍✈️", "**Buses** 🚌", "**Services** 🗺️"])
+    cols_show = ["Alarm Count","Alarm Trips","Alarms per Trip","Alarms per Hour","Total Duration (hr)"]
+
+    with tab1:
+        df_dr = calc_metrics(w1_events.rename(columns={"driver_id":"driver_id"}),
+                             trips_unique.rename(columns={"driver_id":"driver_id"}), "driver_id")
+        _ = st.dataframe(df_dr.sort_values(["Alarms per Trip","Alarm Count"], ascending=[False,False])[cols_show].round(2)) if not df_dr.empty else st.info("No driver events this week.")
+    with tab2:
+        df_bs = calc_metrics(w1_events, trips_unique, "bus_no")
+        _ = st.dataframe(df_bs.sort_values(["Alarms per Trip","Alarm Count"], ascending=[False,False])[cols_show].round(2)) if not df_bs.empty else st.info("No bus events this week.")
+    with tab3:
+        df_sv = calc_metrics(w1_events, trips_unique, "svc_no")
+        _ = st.dataframe(df_sv.sort_values(["Alarms per Trip","Alarm Count"], ascending=[False,False])[cols_show].round(2)) if not df_sv.empty else st.info("No service events this week.")
+
+    return None
+
+if __name__ == "__main__":
+    _ = main()
