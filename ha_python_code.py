@@ -10,7 +10,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-APP_VERSION = "v-weekpicker-generic-alarm-2025-09-22-final-clean-ui"
+APP_VERSION = "v-weekpicker-generic-alarm-2025-09-22-final-clean-ui-thresholds"
 st.set_page_config(page_title="Alarm Insights Dashboard", page_icon="📊", layout="wide")
 
 ALARM_MAP = {
@@ -228,16 +228,26 @@ def calc_metrics(ev_df: pd.DataFrame, trips_df: pd.DataFrame, category: str) -> 
     df["Alarms per Hour"] = (df["Alarm Count"] / dur_nz).fillna(0.0)
     return df
 
-def trend_chart(df_agg: pd.DataFrame, y_col: str, title_metric: str):
+# ---------- Trend chart (dynamic thresholds) ----------
+def trend_chart(df_agg: pd.DataFrame, y_col: str, title_metric: str, alarm_code: str):
     fig = go.Figure()
     if df_agg.empty:
         return fig
-    max_y = max(6, float(df_agg[y_col].max()) * 1.1)
-    
-    fig.add_hrect(y0=0, y1=2, line_width=0, fillcolor="green",  opacity=0.1, layer="below")
-    fig.add_hrect(y0=2, y1=4, line_width=0, fillcolor="yellow", opacity=0.1, layer="below")
-    fig.add_hrect(y0=4, y1=max_y, line_width=0, fillcolor="red",    opacity=0.1, layer="below")
-    
+
+    # thresholds by alarm
+    if str(alarm_code).upper() == "HB":
+        lo, hi = 2.0, 4.0
+    else:  # HA, HC
+        lo, hi = 3.0, 5.0
+
+    max_y = max(hi + 1, float(df_agg[y_col].max()) * 1.1)
+
+    # background bands
+    fig.add_hrect(y0=0,   y1=lo, line_width=0, fillcolor="green",  opacity=0.10, layer="below")
+    fig.add_hrect(y0=lo,  y1=hi, line_width=0, fillcolor="yellow", opacity=0.10, layer="below")
+    fig.add_hrect(y0=hi,  y1=max_y, line_width=0, fillcolor="red", opacity=0.10, layer="below")
+
+    # series
     fig.add_trace(go.Scatter(
         x=df_agg["week_label"], y=df_agg[y_col],
         mode="lines+markers+text", name=title_metric,
@@ -246,10 +256,11 @@ def trend_chart(df_agg: pd.DataFrame, y_col: str, title_metric: str):
         textfont=dict(color="black", size=12),
         hovertemplate="Week: %{x}<br>"+title_metric+": %{y:.2f}<extra></extra>"
     ))
-    
-    fig.add_hline(y=2.0, line_width=1.5, line_dash="dash", line_color="green")
-    fig.add_hline(y=4.0, line_width=1.5, line_dash="dash", line_color="red")
-    
+
+    # dotted threshold lines
+    fig.add_hline(y=lo, line_width=1.5, line_dash="dash", line_color="green")
+    fig.add_hline(y=hi, line_width=1.5, line_dash="dash", line_color="red")
+
     fig.update_layout(
         title_text="12-Week Trend: " + title_metric,
         yaxis_title=title_metric, xaxis_title="Week",
@@ -510,7 +521,14 @@ def main():
 
     weekly_sum["week_label"] = weekly_sum["start_of_week"].dt.strftime("%d %b") + "<br>W" + weekly_sum["alarm_week"].astype(int).astype(str)
     chart_data = weekly_sum[weekly_sum["start_of_week"] <= w1_sow].tail(12)
-    _ = st.plotly_chart(trend_chart(chart_data, "per_bc", f"Avg {ALARM_MAP[alarm_choice]['short']} per Bus Captain"), use_container_width=True)
+    _ = st.plotly_chart(
+        trend_chart(
+            chart_data, "per_bc",
+            f"Avg {ALARM_MAP[alarm_choice]['short']} per Bus Captain",
+            alarm_choice
+        ),
+        use_container_width=True
+    )
 
     # ===== Current-week slices =====
     if df_alarm.empty:
