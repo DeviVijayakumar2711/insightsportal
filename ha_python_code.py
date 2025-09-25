@@ -21,17 +21,20 @@ ALARM_MAP = {
 def _cfg(key: str, default: str = "") -> str:
     """
     Prioritize environment variables (Azure App Service 'Application settings').
-    Fallback to Streamlit secrets or default for local dev.
+    Fallback to Streamlit secrets for local dev.
     """
-    val = os.getenv(key, None)
-    if val is None:
-        try:
-            # st.secrets() call here is what causes the warning on Azure
-            # We can leave this in as it's the standard for Streamlit Cloud / local dev
-            val = st.secrets.get(key)
-        except Exception:
-            val = None
-    return (val if val is not None else default).strip()
+    val = os.getenv(key)
+    if val is not None:
+        return val.strip()
+
+    try:
+        val = st.secrets.get(key)
+        if val is not None:
+            return val.strip()
+    except Exception:
+        pass # The exception block now catches the "No secrets files" warning gracefully.
+
+    return default.strip()
 
 def _maybe_mtime(p: str) -> float:
     return 0.0
@@ -220,7 +223,6 @@ def trend_chart(df_agg: pd.DataFrame, y_col: str, title_metric: str):
         return fig
     max_y = max(6, float(df_agg[y_col].max()) * 1.1)
     
-    # Updated threshold lines for HB
     fig.add_hrect(y0=0, y1=2, line_width=0, fillcolor="green",  opacity=0.1, layer="below")
     fig.add_hrect(y0=2, y1=4, line_width=0, fillcolor="yellow", opacity=0.1, layer="below")
     fig.add_hrect(y0=4, y1=max_y, line_width=0, fillcolor="red",    opacity=0.1, layer="below")
@@ -234,7 +236,6 @@ def trend_chart(df_agg: pd.DataFrame, y_col: str, title_metric: str):
         hovertemplate="Week: %{x}<br>"+title_metric+": %{y:.2f}<extra></extra>"
     ))
     
-    # Updated dotted lines for HB
     fig.add_hline(y=2.0, line_width=1.5, line_dash="dash", line_color="green")
     fig.add_hline(y=4.0, line_width=1.5, line_dash="dash", line_color="red")
     
@@ -441,7 +442,6 @@ def main():
 
     _ = st.title(f"Weekly {ALARM_MAP[alarm_choice]['long']} Review")
 
-    # Fast base slice (cached)
     df_alarm, week_map, weekly = slice_by_filters(
         df_raw, weekly_all, depots_tuple, alarm_choice, only_completed, exclude_null_driver
     )
@@ -449,7 +449,6 @@ def main():
         _ = st.info("No events found with the current filters.")
         return
 
-    # --- Process chat AFTER data slice so answers use df_alarm ---
     with chat_box:
         if pending_q:
             ans, tbl = answer_entity_question(pending_q, alarm_choice, df_alarm)
@@ -462,12 +461,10 @@ def main():
                 st.dataframe(item["df"], height=200, use_container_width=True)
             st.markdown("---")
 
-    # Week picker
     sel_label = st.sidebar.selectbox("Week", options=week_map["label"].tolist(), index=len(week_map)-1, key="week_select_fast")
     sel_row = week_map.loc[week_map["label"] == sel_label].iloc[0]
     w1_year, w1_week = int(sel_row["alarm_year"]), int(sel_row["alarm_week"])
 
-    # KPIs (cached)
     weekly_sum, total_headcount = per_week_kpis(weekly, headcounts, depots_tuple)
     if total_headcount <= 0 or weekly_sum.empty:
         _ = st.error("Selected depots have zero headcount or no weekly data.")
@@ -500,7 +497,6 @@ def main():
     chart_data = weekly_sum[weekly_sum["start_of_week"] <= w1_sow].tail(12)
     _ = st.plotly_chart(trend_chart(chart_data, "per_bc", f"Avg {ALARM_MAP[alarm_choice]['short']} per Bus Captain"), use_container_width=True)
 
-    # ===== Current-week slices =====
     if df_alarm.empty:
         w1_events = pd.DataFrame(columns=["trip_id_norm","driver_id","bus_no","svc_no","trip_duration_hr"])
         trips_unique = pd.DataFrame(columns=["trip_id_norm","driver_id","bus_no","svc_no","trip_duration_hr"])
@@ -511,7 +507,6 @@ def main():
         ]
         trips_unique = w1_events.drop_duplicates(subset=["trip_id_norm"])
 
-    # ----- AI Deep Dive -----
     _ = st.markdown("---")
     _ = st.subheader("🤖 AI-Powered Deep Dive")
     if llm is None:
@@ -536,7 +531,6 @@ def main():
     if w1_events.empty:
         _ = st.caption("Note: No matching event rows found. Tables will be empty.")
 
-    # ----- Manual Tables -----
     _ = st.markdown("---")
     _ = st.subheader(f"🔬 Manual Analysis Tables: Week {w1_week}")
     tab1, tab2, tab3 = st.tabs(["**Drivers** 🧑‍✈️", "**Buses** 🚌", "**Services** 🗺️"])
