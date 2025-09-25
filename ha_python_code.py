@@ -8,7 +8,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-APP_VERSION = "v-weekpicker-generic-alarm-2025-09-22-cloud-first-fix"
+APP_VERSION = "v-weekpicker-generic-alarm-2025-09-22-cloud-first-fix-final"
 st.set_page_config(page_title="Alarm Insights Dashboard", page_icon="📊", layout="wide")
 
 ALARM_MAP = {
@@ -205,11 +205,9 @@ def calc_metrics(ev_df: pd.DataFrame, trips_df: pd.DataFrame, category: str) -> 
     else:
         dur = pd.Series(0.0, index=counts.index, name="Total Duration (hr)")
 
-    # Combine metrics and reset index
     df = pd.concat([counts, trips_unique, dur], axis=1).fillna({"Alarm Trips": 0, "Total Duration (hr)": 0.0})
-    df = df.reset_index()
-    df.rename(columns={'index': category}, inplace=True)
-
+    df = df.reset_index().rename(columns={'index': category})
+    
     trips_nonzero = df["Alarm Trips"].replace({0: pd.NA})
     df["Alarms per Trip"] = (df["Alarm Count"] / trips_nonzero).fillna(0.0)
     dur_nz = df["Total Duration (hr)"].where(df["Total Duration (hr)"] > 0)
