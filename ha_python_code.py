@@ -24,7 +24,7 @@ def _cfg(key: str, default: str = "") -> str:
     Fallback to Streamlit secrets or default for local dev.
     """
     val = os.getenv(key, None)
-    if val is None and 'STREAMLIT_SERVER_RUN_ON_SAVE' not in os.environ:
+    if val is None:
         try:
             val = st.secrets.get(key)
         except Exception:
@@ -32,6 +32,7 @@ def _cfg(key: str, default: str = "") -> str:
     return (val if val is not None else default).strip()
 
 def _maybe_mtime(p: str) -> float:
+    """Local files get mtime for cache busting; URLs return 0.0."""
     return 0.0
 
 # ---------- AI (optional) ----------
@@ -217,9 +218,15 @@ def trend_chart(df_agg: pd.DataFrame, y_col: str, title_metric: str):
     if df_agg.empty:
         return fig
     max_y = max(6, float(df_agg[y_col].max()) * 1.1)
-    fig.add_hrect(y0=0, y1=3, line_width=0, fillcolor="green",  opacity=0.1, layer="below")
-    fig.add_hrect(y0=3, y1=5, line_width=0, fillcolor="yellow", opacity=0.1, layer="below")
-    fig.add_hrect(y0=5, y1=max_y, line_width=0, fillcolor="red",    opacity=0.1, layer="below")
+    
+    # Updated threshold lines for HB
+    # Use y0=0, y1=2 for green
+    fig.add_hrect(y0=0, y1=2, line_width=0, fillcolor="green",  opacity=0.1, layer="below")
+    # Use y0=2, y1=4 for yellow
+    fig.add_hrect(y0=2, y1=4, line_width=0, fillcolor="yellow", opacity=0.1, layer="below")
+    # Use y0=4, y1=max_y for red
+    fig.add_hrect(y0=4, y1=max_y, line_width=0, fillcolor="red",    opacity=0.1, layer="below")
+    
     fig.add_trace(go.Scatter(
         x=df_agg["week_label"], y=df_agg[y_col],
         mode="lines+markers+text", name=title_metric,
@@ -228,8 +235,11 @@ def trend_chart(df_agg: pd.DataFrame, y_col: str, title_metric: str):
         textfont=dict(color="black", size=12),
         hovertemplate="Week: %{x}<br>"+title_metric+": %{y:.2f}<extra></extra>"
     ))
-    fig.add_hline(y=3.0, line_width=1.5, line_dash="dash", line_color="green")
-    fig.add_hline(y=5.0, line_width=1.5, line_dash="dash", line_color="red")
+    
+    # Updated dotted lines for HB
+    fig.add_hline(y=2.0, line_width=1.5, line_dash="dash", line_color="green")
+    fig.add_hline(y=4.0, line_width=1.5, line_dash="dash", line_color="red")
+    
     fig.update_layout(
         title_text="12-Week Trend: " + title_metric,
         yaxis_title=title_metric, xaxis_title="Week",
@@ -407,7 +417,6 @@ def main():
         )
         st.markdown("### ⚙️ Filters")
 
-        # Get data sources from environment variables (cloud-first)
         tele_file = _cfg("TELEMATICS_URL") or _cfg("TELEMATICS_PATH")
         excl_file = _cfg("EXCLUSIONS_URL") or _cfg("EXCLUSIONS_PATH")
         head_file = _cfg("HEADCOUNTS_URL") or _cfg("HEADCOUNTS_PATH")
