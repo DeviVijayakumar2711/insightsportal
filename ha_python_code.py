@@ -8,7 +8,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-APP_VERSION = "v-weekpicker-generic-alarm-2025-09-22-cloud-first-fix-final"
+APP_VERSION = "v-weekpicker-generic-alarm-2025-09-22-final-clean-ui"
 st.set_page_config(page_title="Alarm Insights Dashboard", page_icon="📊", layout="wide")
 
 ALARM_MAP = {
@@ -24,17 +24,14 @@ def _cfg(key: str, default: str = "") -> str:
     Fallback to Streamlit secrets or default for local dev.
     """
     val = os.getenv(key, None)
-    if val is None:
+    if val is None and 'STREAMLIT_SERVER_RUN_ON_SAVE' not in os.environ:
         try:
-            # st.secrets() call here is what causes the warning on Azure
-            # We can leave this in as it's the standard for Streamlit Cloud / local dev
             val = st.secrets.get(key)
         except Exception:
             val = None
     return (val if val is not None else default).strip()
 
 def _maybe_mtime(p: str) -> float:
-    """Local files get mtime for cache busting; URLs return 0.0."""
     return 0.0
 
 # ---------- AI (optional) ----------
@@ -69,7 +66,6 @@ def initialize_llm():
 # ---------- Load & normalize once ----------
 @st.cache_data
 def load_and_process_data(telematics_file, exclusions_file, headcounts_file, file_mtime, _v=APP_VERSION):
-    # Use pandas' native support for reading from URLs or local paths
     df_raw = pd.read_csv(telematics_file)
     df_excl = pd.read_csv(exclusions_file)
     df_head = pd.read_csv(headcounts_file)
