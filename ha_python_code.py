@@ -26,13 +26,14 @@ def _cfg(key: str, default: str = "") -> str:
     val = os.getenv(key, None)
     if val is None:
         try:
+            # st.secrets() call here is what causes the warning on Azure
+            # We can leave this in as it's the standard for Streamlit Cloud / local dev
             val = st.secrets.get(key)
         except Exception:
             val = None
     return (val if val is not None else default).strip()
 
 def _maybe_mtime(p: str) -> float:
-    """Local files get mtime for cache busting; URLs return 0.0."""
     return 0.0
 
 # ---------- AI (optional) ----------
@@ -220,11 +221,8 @@ def trend_chart(df_agg: pd.DataFrame, y_col: str, title_metric: str):
     max_y = max(6, float(df_agg[y_col].max()) * 1.1)
     
     # Updated threshold lines for HB
-    # Use y0=0, y1=2 for green
     fig.add_hrect(y0=0, y1=2, line_width=0, fillcolor="green",  opacity=0.1, layer="below")
-    # Use y0=2, y1=4 for yellow
     fig.add_hrect(y0=2, y1=4, line_width=0, fillcolor="yellow", opacity=0.1, layer="below")
-    # Use y0=4, y1=max_y for red
     fig.add_hrect(y0=4, y1=max_y, line_width=0, fillcolor="red",    opacity=0.1, layer="below")
     
     fig.add_trace(go.Scatter(
