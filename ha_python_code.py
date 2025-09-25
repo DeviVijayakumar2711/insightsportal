@@ -1,6 +1,8 @@
 # app.py — single, fast HA/HB/HC app with a visible sidebar chatbot (cloud-first)
 import os
 import re
+from pathlib import Path
+
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
@@ -17,26 +19,35 @@ ALARM_MAP = {
     "HC": {"long": "Harsh Cornering",    "short": "HC"},
 }
 
-# ---------- config helpers (ENV-first) ----------
+# ---------- config helpers (ENV-first, no TOML warning) ----------
+_SECRETS_CANDIDATES = [
+    Path(".streamlit/secrets.toml"),
+    Path.home() / ".streamlit" / "secrets.toml",
+]
+
+def _has_secrets_file() -> bool:
+    return any(p.exists() for p in _SECRETS_CANDIDATES)
+
 def _cfg(key: str, default: str = "") -> str:
     """
-    Prioritize environment variables (Azure App Service 'Application settings').
-    Fallback to Streamlit secrets for local dev.
+    1) Environment variables (Azure App Settings / .env)  <-- your blob URLs live here
+    2) .streamlit/secrets.toml (ONLY if file exists; avoids Streamlit warning)
+    3) provided default
     """
-    val = os.getenv(key)
-    if val is not None:
-        return val.strip()
+    v = os.environ.get(key)
+    if v not in (None, ""):
+        return str(v).strip()
 
-    try:
-        val = st.secrets.get(key)
-        if val is not None:
-            return val.strip()
-    except Exception:
-        pass # The exception block now catches the "No secrets files" warning gracefully.
+    if _has_secrets_file():
+        try:
+            return str(st.secrets.get(key, default)).strip()
+        except Exception:
+            pass
 
-    return default.strip()
+    return str(default).strip()
 
-def _maybe_mtime(p: str) -> float:
+def _maybe_mtime(_: str) -> float:
+    # Avoids cache busting from mtime when using URLs
     return 0.0
 
 # ---------- AI (optional) ----------
@@ -442,6 +453,7 @@ def main():
 
     _ = st.title(f"Weekly {ALARM_MAP[alarm_choice]['long']} Review")
 
+    # Fast base slice (cached)
     df_alarm, week_map, weekly = slice_by_filters(
         df_raw, weekly_all, depots_tuple, alarm_choice, only_completed, exclude_null_driver
     )
@@ -449,6 +461,7 @@ def main():
         _ = st.info("No events found with the current filters.")
         return
 
+    # --- Process chat AFTER data slice so answers use df_alarm ---
     with chat_box:
         if pending_q:
             ans, tbl = answer_entity_question(pending_q, alarm_choice, df_alarm)
@@ -461,10 +474,12 @@ def main():
                 st.dataframe(item["df"], height=200, use_container_width=True)
             st.markdown("---")
 
+    # Week picker
     sel_label = st.sidebar.selectbox("Week", options=week_map["label"].tolist(), index=len(week_map)-1, key="week_select_fast")
     sel_row = week_map.loc[week_map["label"] == sel_label].iloc[0]
     w1_year, w1_week = int(sel_row["alarm_year"]), int(sel_row["alarm_week"])
 
+    # KPIs (cached)
     weekly_sum, total_headcount = per_week_kpis(weekly, headcounts, depots_tuple)
     if total_headcount <= 0 or weekly_sum.empty:
         _ = st.error("Selected depots have zero headcount or no weekly data.")
@@ -497,6 +512,7 @@ def main():
     chart_data = weekly_sum[weekly_sum["start_of_week"] <= w1_sow].tail(12)
     _ = st.plotly_chart(trend_chart(chart_data, "per_bc", f"Avg {ALARM_MAP[alarm_choice]['short']} per Bus Captain"), use_container_width=True)
 
+    # ===== Current-week slices =====
     if df_alarm.empty:
         w1_events = pd.DataFrame(columns=["trip_id_norm","driver_id","bus_no","svc_no","trip_duration_hr"])
         trips_unique = pd.DataFrame(columns=["trip_id_norm","driver_id","bus_no","svc_no","trip_duration_hr"])
@@ -507,6 +523,7 @@ def main():
         ]
         trips_unique = w1_events.drop_duplicates(subset=["trip_id_norm"])
 
+    # ----- AI Deep Dive -----
     _ = st.markdown("---")
     _ = st.subheader("🤖 AI-Powered Deep Dive")
     if llm is None:
@@ -531,6 +548,7 @@ def main():
     if w1_events.empty:
         _ = st.caption("Note: No matching event rows found. Tables will be empty.")
 
+    # ----- Manual Tables -----
     _ = st.markdown("---")
     _ = st.subheader(f"🔬 Manual Analysis Tables: Week {w1_week}")
     tab1, tab2, tab3 = st.tabs(["**Drivers** 🧑‍✈️", "**Buses** 🚌", "**Services** 🗺️"])
