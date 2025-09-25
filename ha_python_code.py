@@ -26,6 +26,8 @@ def _cfg(key: str, default: str = "") -> str:
     val = os.getenv(key, None)
     if val is None:
         try:
+            # st.secrets() call here is what causes the warning on Azure
+            # We can leave this in as it's the standard for Streamlit Cloud / local dev
             val = st.secrets.get(key)
         except Exception:
             val = None
@@ -418,7 +420,6 @@ def main():
             st.error("Data file paths are not configured. Please set TELEMATICS_URL/PATH, EXCLUSIONS_URL/PATH, and HEADCOUNTS_URL/PATH in your environment variables.")
             return
 
-        st.caption(f"Data sources: {tele_file} | {excl_file} | {head_file}")
         file_mtime = max(_maybe_mtime(tele_file), _maybe_mtime(excl_file), _maybe_mtime(head_file))
 
     headcounts, df_raw, weekly_all = load_and_process_data(tele_file, excl_file, head_file, file_mtime)
