@@ -1,7 +1,8 @@
-# app.py — single, fast HA/HB/HC app with a visible sidebar chatbot (cloud-first)
+# app.py — single, fast HA/HB/HC app with a visible sidebar chatbot (cloud-first, smarter assistant)
 import os
 import re
 from pathlib import Path
+from typing import Tuple, Optional
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -10,7 +11,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-APP_VERSION = "v-weekpicker-generic-alarm-2025-09-22-final-clean-ui-thresholds"
+APP_VERSION = "v-weekpicker-generic-alarm-2025-09-22-final-clean-ui-thresholds-assistant-v2"
 st.set_page_config(page_title="Alarm Insights Dashboard", page_icon="📊", layout="wide")
 
 ALARM_MAP = {
@@ -30,7 +31,7 @@ def _has_secrets_file() -> bool:
 
 def _cfg(key: str, default: str = "") -> str:
     """
-    1) Environment variables (Azure App Settings / .env)  <-- your blob URLs live here
+    1) Environment variables (Azure App Settings / .env)
     2) .streamlit/secrets.toml (ONLY if file exists; avoids Streamlit warning)
     3) provided default
     """
@@ -49,6 +50,7 @@ def _cfg(key: str, default: str = "") -> str:
 def _maybe_mtime(_: str) -> float:
     # Avoids cache busting from mtime when using URLs
     return 0.0
+
 
 # ---------- AI (optional) ----------
 try:
@@ -78,6 +80,7 @@ def initialize_llm():
         return llm
     except Exception:
         return None
+
 
 # ---------- Load & normalize once ----------
 @st.cache_data
@@ -145,6 +148,7 @@ def load_and_process_data(telematics_file, exclusions_file, headcounts_file, fil
     )
     return df_head, df_raw, weekly_all
 
+
 # ---------- Fast slices ----------
 @st.cache_data
 def slice_by_filters(df_raw: pd.DataFrame, weekly_all: pd.DataFrame,
@@ -181,6 +185,7 @@ def slice_by_filters(df_raw: pd.DataFrame, weekly_all: pd.DataFrame,
 
     return df_alarm, week_map, weekly
 
+
 @st.cache_data
 def per_week_kpis(weekly: pd.DataFrame, headcounts: pd.DataFrame, depots_tuple: tuple):
     head_sel = headcounts[headcounts["depot_id"].isin(depots_tuple)]
@@ -194,6 +199,7 @@ def per_week_kpis(weekly: pd.DataFrame, headcounts: pd.DataFrame, depots_tuple: 
         format="%G%V%w", errors="coerce"
     )
     return weekly_sum, total_headcount
+
 
 # ---------- Metrics ----------
 def calc_metrics(ev_df: pd.DataFrame, trips_df: pd.DataFrame, category: str) -> pd.DataFrame:
@@ -227,6 +233,7 @@ def calc_metrics(ev_df: pd.DataFrame, trips_df: pd.DataFrame, category: str) -> 
     dur_nz = df["Total Duration (hr)"].where(df["Total Duration (hr)"] > 0)
     df["Alarms per Hour"] = (df["Alarm Count"] / dur_nz).fillna(0.0)
     return df
+
 
 # ---------- Trend chart (dynamic thresholds) ----------
 def trend_chart(df_agg: pd.DataFrame, y_col: str, title_metric: str, alarm_code: str):
@@ -269,6 +276,8 @@ def trend_chart(df_agg: pd.DataFrame, y_col: str, title_metric: str, alarm_code:
     )
     return fig
 
+
+# ---------- AI deep dive ----------
 @st.cache_data(show_spinner=False)
 def generate_ai_deep_dive(_llm, alarm_code, w1_metric, delta, driver_perf, bus_perf, svc_perf, fleet_avg_per_trip, _v=APP_VERSION):
     if _llm is None:
@@ -317,22 +326,39 @@ Return a 3-row table: Priority | Recommended Action | Data-Driven Rationale.
     except Exception as e:
         return f"AI error: {e}"
 
+
 # ---------- Chatbot helpers ----------
-def _parse_query(q: str):
+def _parse_query(q: str) -> Tuple[str, Optional[str], int, Optional[int], Optional[int]]:
+    """
+    Returns (etype, entity_id_or_text, n_weeks, week, year)
+    etype ∈ {'driver','bus','svc','drivers','buses','services','generic'}
+    """
     if not q:
-        return None, None, 12, None, None
+        return "generic", None, 12, None, None
+
     ql = q.strip().lower()
 
+    # Weeks window
     m = re.search(r"last\s+(\d+)\s*weeks?", ql)
     n_weeks = int(m.group(1)) if m else 12
     n_weeks = max(1, min(n_weeks, 52))
 
+    # Specific week / year (optional)
     wk = None; yr = None
     m = re.search(r"(?:^|\b)w(?:eek)?\s*[-_ ]?(\d{1,2})(?:\D|$)", ql)
     if m: wk = int(m.group(1))
     m2 = re.search(r"\b(20\d{2})\b", ql)
     if m2: yr = int(m2.group(1))
 
+    # Plural / fleet scopes
+    if "all drivers" in ql or re.search(r"\bdrivers\b", ql):
+        return "drivers", None, n_weeks, wk, yr
+    if "all buses" in ql or re.search(r"\bbuses\b", ql):
+        return "buses", None, n_weeks, wk, yr
+    if "all services" in ql or re.search(r"\bservices\b", ql):
+        return "services", None, n_weeks, wk, yr
+
+    # Single entities
     for pat, etype in [
         (r"(?:driver|bc|captain)\s*#?\s*([a-z0-9._-]+)", "driver"),
         (r"(?:bus|vehicle)\s*#?\s*([a-z0-9._-]+)", "bus"),
@@ -342,9 +368,9 @@ def _parse_query(q: str):
         if m:
             return etype, m.group(1).upper(), n_weeks, wk, yr
 
-    m = re.search(r"\b([a-z0-9._-]+)\b", ql)
-    guess = m.group(1).upper() if m else None
-    return None, guess, n_weeks, wk, yr
+    # Generic fleet question
+    return "generic", q.strip(), n_weeks, wk, yr
+
 
 def vector_week_start(year_series, week_series):
     return pd.to_datetime(
@@ -352,61 +378,143 @@ def vector_week_start(year_series, week_series):
         format="%G%V%w", errors="coerce"
     )
 
-def answer_entity_question(q: str, alarm_choice: str, df_alarm: pd.DataFrame):
+
+def _limit_last_n_weeks(df: pd.DataFrame, n_weeks: int) -> pd.DataFrame:
+    """Filter df (with alarm_year/week) to last n weeks available in df."""
+    if df.empty:
+        return df
+    df = df.copy()
+    df["sow"] = vector_week_start(df["alarm_year"], df["alarm_week"])
+    latest = df["sow"].max()
+    if pd.isna(latest):
+        return df
+    cutoff = latest - pd.Timedelta(weeks=n_weeks - 1)
+    return df[df["sow"] >= cutoff]
+
+
+def answer_entity_question(q: str, alarm_choice: str, df_alarm: pd.DataFrame, llm=None):
     etype, eid, n_weeks, wk, yr = _parse_query(q)
-    if etype not in {"driver","bus","svc"}:
-        return (
-            "I couldn’t find a specific entity. Try:\n"
-            "- `driver 30450 last 4 weeks`\n"
-            "- `bus 123 W35 2025`\n"
-            "- `svc 973 last 8 weeks`"
-        ), pd.DataFrame()
 
-    col_map = {"driver": "driver_id", "bus": "bus_no", "svc": "svc_no"}
-    col = col_map[etype]
-    subset = df_alarm[df_alarm[col].astype(str).str.upper() == str(eid).upper()].copy()
-    if subset.empty:
-        return f"No {ALARM_MAP[alarm_choice]['short']} events found for **{etype} {eid}** with current filters.", pd.DataFrame()
-
-    subset["start_of_week"] = vector_week_start(subset["alarm_year"], subset["alarm_week"])
-
-    if wk is not None:
-        if yr is None:
-            yr = int(pd.to_numeric(subset["alarm_year"], errors="coerce").dropna().max())
-        sow = vector_week_start(pd.Series([yr]), pd.Series([wk]))[0]
-        subset = subset[subset["start_of_week"] == sow]
+    # --- Single entity (driver/bus/svc) – keep your existing behavior, add last-n-weeks totals ---
+    if etype in {"driver","bus","svc"}:
+        col_map = {"driver": "driver_id", "bus": "bus_no", "svc": "svc_no"}
+        col = col_map[etype]
+        subset = df_alarm[df_alarm[col].astype(str).str.upper() == str(eid).upper()].copy()
         if subset.empty:
-            return f"No events for **{etype} {eid}** in **W{wk} {yr}**.", pd.DataFrame()
+            return f"No {ALARM_MAP[alarm_choice]['short']} events found for **{etype} {eid}** with current filters.", pd.DataFrame()
 
-    weekly = (subset.groupby(["alarm_year","alarm_week"], as_index=False)
-                     .size().rename(columns={"size":"Events"}))
-    weekly["start_of_week"] = vector_week_start(weekly["alarm_year"], weekly["alarm_week"])
-    weekly = weekly.sort_values("start_of_week")
+        # limit by explicit week if given
+        subset["start_of_week"] = vector_week_start(subset["alarm_year"], subset["alarm_week"])
+        if wk is not None:
+            if yr is None:
+                yr = int(pd.to_numeric(subset["alarm_year"], errors="coerce").dropna().max())
+            sow = vector_week_start(pd.Series([yr]), pd.Series([wk]))[0]
+            subset = subset[subset["start_of_week"] == sow]
+            if subset.empty:
+                return f"No events for **{etype} {eid}** in **W{wk} {yr}**.", pd.DataFrame()
 
-    weekly_window = weekly.tail(n_weeks).copy()
-    weekly_window["Week"] = "W" + weekly_window["alarm_week"].astype(int).astype(str) + " · " + weekly_window["alarm_year"].astype(int).astype(str)
-    weekly_window = weekly_window[["Week","Events"]]
+        # window: last n weeks (for totals & table)
+        subset_win = _limit_last_n_weeks(subset, n_weeks)
 
-    trips_unique = subset.drop_duplicates(subset=["trip_id_norm"])
-    total_events = int(len(subset))
-    total_trips = int(trips_unique["trip_id_norm"].nunique())
-    total_hours = float(trips_unique["trip_duration_hr"].sum())
-    per_trip = (total_events / total_trips) if total_trips > 0 else 0.0
-    per_hour = (total_events / total_hours) if total_hours > 0 else 0.0
+        weekly = (subset_win.groupby(["alarm_year","alarm_week"], as_index=False)
+                            .size().rename(columns={"size":"Events"}))
+        weekly["start_of_week"] = vector_week_start(weekly["alarm_year"], weekly["alarm_week"])
+        weekly = weekly.sort_values("start_of_week")
+        weekly["Week"] = "W" + weekly["alarm_week"].astype(int).astype(str) + " · " + weekly["alarm_year"].astype(int).astype(str)
+        weekly_table = weekly[["Week","Events"]]
 
-    peak_row = weekly.sort_values("Events", ascending=False).head(1)
-    peak_txt = ""
-    if not peak_row.empty:
-        pw = int(peak_row["alarm_week"].iloc[0]); py = int(peak_row["alarm_year"].iloc[0]); pc = int(peak_row["Events"].iloc[0])
-        peak_txt = f" Peak: **W{pw} {py}** with **{pc}** events."
+        trips_unique = subset_win.drop_duplicates(subset=["trip_id_norm"])
+        total_events = int(len(subset_win))
+        total_trips = int(trips_unique["trip_id_norm"].nunique())
+        total_hours = float(trips_unique["trip_duration_hr"].sum())
+        per_trip = (total_events / total_trips) if total_trips > 0 else 0.0
+        per_hour = (total_events / total_hours) if total_hours > 0 else 0.0
 
-    answer = (
-        f"**{ALARM_MAP[alarm_choice]['short']}** for **{etype} {eid}** (current depots/filters):\n"
-        f"- Total events: **{total_events}** across **{total_trips}** trips\n"
-        f"- Alarms per Trip: **{per_trip:.2f}** | Alarms per Hour: **{per_hour:.2f}**\n"
-        f"- Showing last **{min(n_weeks, len(weekly))}** weeks from available data.{peak_txt}"
-    )
-    return answer, weekly_window
+        peak_row = weekly.sort_values("Events", ascending=False).head(1)
+        peak_txt = ""
+        if not peak_row.empty:
+            pw = int(peak_row["alarm_week"].iloc[0]); py = int(peak_row["alarm_year"].iloc[0]); pc = int(peak_row["Events"].iloc[0])
+            peak_txt = f" Peak: **W{pw} {py}** with **{pc}** events."
+
+        answer = (
+            f"**{ALARM_MAP[alarm_choice]['short']}** for **{etype} {eid}** (current depots/filters):\n"
+            f"- Window: last **{n_weeks}** weeks\n"
+            f"- Total events: **{total_events}** across **{total_trips}** trips\n"
+            f"- Alarms per Trip: **{per_trip:.2f}** | Alarms per Hour: **{per_hour:.2f}**{peak_txt}"
+        )
+        return answer, weekly_table
+
+    # --- Fleet scopes (drivers/buses/services) ---
+    if etype in {"drivers","buses","services"}:
+        scope_col = {"drivers": "driver_id", "buses": "bus_no", "services": "svc_no"}[etype]
+        subset = _limit_last_n_weeks(df_alarm, n_weeks)
+        if subset.empty:
+            return f"No {etype} found in the last {n_weeks} weeks with current filters.", pd.DataFrame()
+
+        # metrics by scope
+        trips_unique = subset.drop_duplicates(subset=["trip_id_norm"])
+        scope_df = calc_metrics(subset, trips_unique, scope_col)
+        # present a compact, useful view
+        cols = [scope_col, "Alarm Count", "Alarm Trips", "Alarms per Trip", "Alarms per Hour", "Total Duration (hr)"]
+        scope_top = scope_df.sort_values(["Alarms per Trip","Alarm Count"], ascending=[False, False])[cols].head(15).reset_index(drop=True)
+        nice_name = {"driver_id":"Driver", "bus_no":"Bus", "svc_no":"Service"}[scope_col]
+        scope_top = scope_top.rename(columns={scope_col: nice_name})
+        return f"Top {etype} in the last **{n_weeks}** weeks (ranked by *Alarms per Trip*):", scope_top
+
+    # --- Generic fleet question / summary ---
+    if etype == "generic":
+        subset = _limit_last_n_weeks(df_alarm, n_weeks)
+        if subset.empty:
+            return f"No events found in the last {n_weeks} weeks with current filters.", pd.DataFrame()
+
+        total_events = len(subset)
+        drivers = subset["driver_id"].nunique()
+        buses = subset["bus_no"].nunique()
+        svcs = subset["svc_no"].nunique()
+        depots = subset["depot_id_norm"].nunique()
+
+        by_depot = (subset.groupby("depot_id_norm")["trip_id_norm"]
+                    .count().reset_index().rename(columns={"trip_id_norm":"Events"})
+                    .sort_values("Events", ascending=False))
+        depot_line = ""
+        if not by_depot.empty:
+            topd = by_depot.iloc[0]
+            depot_line = f"\n- Top depot: **{topd['depot_id_norm']}** with **{int(topd['Events']):,}** events"
+
+        ans = (
+            f"**Fleet summary** (last **{n_weeks}** weeks, current filters):\n"
+            f"- Events: **{total_events:,}** across **{drivers:,}** drivers, **{buses:,}** buses, **{svcs:,}** services, **{depots:,}** depots"
+            f"{depot_line}"
+        )
+
+        # Optional AI rewrite for natural language answers
+        if initialize_llm() is not None:
+            llm = initialize_llm()
+            try:
+                stats_json = {
+                    "n_weeks": n_weeks,
+                    "totals": {"events": int(total_events), "drivers": int(drivers), "buses": int(buses), "services": int(svcs), "depots": int(depots)},
+                    "by_depot": by_depot.to_dict(orient="records")[:10],
+                }
+                prompt = f"""You are an SMRT safety analyst. Summarize briefly and clearly:
+                Data: {stats_json}
+                Question: {q}
+                Answer in markdown with a short headline and bullets."""
+                ai_ans = llm.predict(prompt)
+                return ai_ans, by_depot.rename(columns={"depot_id_norm":"Depot"})
+            except Exception:
+                pass
+
+        return ans, by_depot.rename(columns={"depot_id_norm":"Depot"})
+
+    # fallback
+    return (
+        "I couldn’t interpret your question. Try:\n"
+        "- `driver 30450 last 4 weeks`\n"
+        "- `all buses last 8 weeks`\n"
+        "- `which depot has most HA alarms last 12 weeks?`"
+    ), pd.DataFrame()
+
 
 # ---------- App ----------
 def main():
@@ -416,10 +524,13 @@ def main():
     chat_box = st.sidebar.container()
     with chat_box:
         st.markdown("### 💬 Assistant — Driver / Bus / Service")
-        st.caption("Examples: `driver 30450 last 4 weeks`, `bus 123 W35 2025`, `svc 973 last 8 weeks`")
+        st.caption(
+            "Examples: `driver 30450 last 4 weeks`, `bus SMB123A`, `svc 973`, "
+            "`all drivers last 8 weeks`, `all buses`, `which depot has most HA alarms?`"
+        )
         if "qa" not in st.session_state:
             st.session_state.qa = []
-        q_input = st.text_input("Question", key="qa_input", placeholder="e.g., driver 30450 last 4 weeks")
+        q_input = st.text_input("Question", key="qa_input", placeholder="e.g., all drivers last 6 weeks")
         colA, colB = st.columns(2)
         ask_clicked = colA.button("Ask", key="qa_btn")
         clear_clicked = colB.button("Clear", key="qa_clear")
@@ -451,7 +562,8 @@ def main():
     headcounts, df_raw, weekly_all = load_and_process_data(tele_file, excl_file, head_file, file_mtime)
     depot_choices = sorted(headcounts["depot_id"].unique()) if not headcounts.empty else []
     with st.sidebar.form("filters_form", clear_on_submit=False):
-        depots = st.multiselect("Depot(s)", depot_choices, default=["WDLAND","KRANJI"] if "WDLAND" in depot_choices else depot_choices[:2])
+        default_depots = ["WDLAND","KRANJI"] if "WDLAND" in depot_choices else depot_choices[:2]
+        depots = st.multiselect("Depot(s)", depot_choices, default=default_depots)
         only_completed = st.checkbox("Only completed weeks (is_week = 'Y')", value=True)
         exclude_null_driver = st.checkbox("Exclude rows with missing/zero driver_id", value=True)
         _ = st.form_submit_button("✅ Apply Filters")
@@ -475,14 +587,14 @@ def main():
     # --- Process chat AFTER data slice so answers use df_alarm ---
     with chat_box:
         if pending_q:
-            ans, tbl = answer_entity_question(pending_q, alarm_choice, df_alarm)
+            ans, tbl = answer_entity_question(pending_q, alarm_choice, df_alarm, llm)
             st.session_state.qa.append({"q": pending_q, "a": ans, "df": tbl})
 
         for item in st.session_state.qa[-4:]:
             st.markdown(f"**You:** {item['q']}")
             st.markdown(item["a"])
             if isinstance(item.get("df"), pd.DataFrame) and not item["df"].empty:
-                st.dataframe(item["df"], height=200, use_container_width=True)
+                st.dataframe(item["df"], height=220, use_container_width=True)
             st.markdown("---")
 
     # Week picker
@@ -585,6 +697,7 @@ def main():
         _ = st.dataframe(df_sv.sort_values(["Alarms per Trip","Alarm Count"], ascending=[False,False])[cols_show].round(2)) if not df_sv.empty else st.info("No service events this week.")
 
     return None
+
 
 if __name__ == "__main__":
     _ = main()
