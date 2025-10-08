@@ -506,7 +506,8 @@ def main():
         return
 
     w1_row = weekly_sum[(weekly_sum["alarm_year"]==w1_year) & (weekly_sum["alarm_week"]==w1_week)]
-    if w1_row.empty():
+    # ---- FIXED: use .empty (property), not .empty() ----
+    if w1_row.empty:
         _ = st.error(f"No data found for Week {w1_week}, {w1_year}.")
         return
 
