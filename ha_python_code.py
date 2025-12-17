@@ -186,6 +186,7 @@ def initialize_llm():
             temperature=0.2
         )
     except Exception as e:
+        # Print error to logs but don't crash app
         print(f"LLM Init Error: {e}")
         return None
 
@@ -199,52 +200,80 @@ class NpEncoder(json.JSONEncoder):
 
 @st.cache_data
 def load_data():
-    # Define file names
-    f_tele = "telematics_new_data_2207.csv"
-    f_head = "depot_headcounts.csv"
-    f_excl = "vehicle_exclusions.csv"
+    """
+    Smart Data Loader:
+    1. Checks for Environment Variable (URL) first.
+    2. Falls back to local file.
+    3. Handles Blob Storage URLs gracefully.
+    """
+    
+    # 1. GET CONFIG (Use the filename from your screenshot as default)
+    path_tele = get_config("TELEMATICS_URL", "telematics_new_data_2207.csv")
+    path_head = get_config("HEADCOUNTS_URL", "depot_headcounts.csv")
+    path_excl = get_config("EXCLUSIONS_URL", "vehicle_exclusions.csv")
 
-    # Check existence
-    if not os.path.exists(f_tele):
-        st.error(f"❌ Missing file: {f_tele}. Please upload it to the Azure App Service.")
-        return pd.DataFrame(), pd.DataFrame()
+    # Helper: Read CSV from URL or Local
+    def smart_read(path_val, is_required=False):
+        if not path_val:
+            return pd.DataFrame()
         
-    try:
-        df = pd.read_csv(f_tele)
+        path_str = str(path_val).strip()
         
-        if os.path.exists(f_head):
-            headcounts = pd.read_csv(f_head)
+        # A) Is it a URL? (Azure Blob with SAS Token)
+        if path_str.lower().startswith("http"):
+            try:
+                # Pandas reads URLs directly
+                return pd.read_csv(path_str)
+            except Exception as e:
+                if is_required:
+                    st.error(f"❌ Failed to read URL for {path_val}. Error: {e}")
+                return pd.DataFrame()
+        
+        # B) Is it a Local File?
         else:
-            headcounts = pd.DataFrame(columns=['depot_id', 'headcount'])
+            if os.path.exists(path_str):
+                return pd.read_csv(path_str)
+            else:
+                if is_required:
+                    st.error(f"❌ Missing file: {path_str}. Please upload it or set the TELEMATICS_URL environment variable.")
+                return pd.DataFrame()
 
-        if os.path.exists(f_excl):
-            exclusions = pd.read_csv(f_excl)
-        else:
-            exclusions = pd.DataFrame(columns=['bus_no'])
-        
-        # Normalize
-        df.columns = [c.lower().strip() for c in df.columns]
-        for c in ['bus_no', 'driver_id', 'alarm_type', 'depot_id', 'svc_no']:
-            if c in df.columns: 
-                df[c] = df[c].astype(str).str.strip().str.upper()
-                df[c] = df[c].replace(['NAN', 'NULL', 'NONE', ''], None)
-        
-        if 'depot_id' in headcounts.columns:
-            headcounts['depot_id'] = headcounts['depot_id'].astype(str).str.strip().str.upper()
+    # 2. LOAD
+    df = smart_read(path_tele, is_required=True)
+    headcounts = smart_read(path_head)
+    exclusions = smart_read(path_excl)
 
-        if not exclusions.empty and 'bus_no' in exclusions.columns:
-            excl_list = set(exclusions['bus_no'].astype(str).str.strip().str.upper())
-            df = df[~df['bus_no'].isin(excl_list)]
-
-        df['date'] = pd.to_datetime(df.get('alarm_calendar_date'), dayfirst=True, errors='coerce')
-        df['year'] = df['date'].dt.isocalendar().year
-        df['week'] = df['date'].dt.isocalendar().week
-        
-        return df, headcounts
-        
-    except Exception as e:
-        st.error(f"Error reading CSV files: {str(e)}")
+    if df.empty:
         return pd.DataFrame(), pd.DataFrame()
+
+    # 3. PRE-PROCESS
+    # Normalize columns
+    df.columns = [c.lower().strip() for c in df.columns]
+    
+    # Clean string columns
+    for c in ['bus_no', 'driver_id', 'alarm_type', 'depot_id', 'svc_no']:
+        if c in df.columns: 
+            df[c] = df[c].astype(str).str.strip().str.upper()
+            df[c] = df[c].replace(['NAN', 'NULL', 'NONE', ''], None)
+    
+    # Process headcounts
+    if not headcounts.empty and 'depot_id' in headcounts.columns:
+        headcounts['depot_id'] = headcounts['depot_id'].astype(str).str.strip().str.upper()
+    else:
+        # Fallback empty df with correct columns
+        headcounts = pd.DataFrame(columns=['depot_id', 'headcount'])
+
+    # Process exclusions
+    if not exclusions.empty and 'bus_no' in exclusions.columns:
+        excl_list = set(exclusions['bus_no'].astype(str).str.strip().str.upper())
+        df = df[~df['bus_no'].isin(excl_list)]
+
+    # Parse Dates
+    df['date'] = pd.to_datetime(df.get('alarm_calendar_date'), dayfirst=True, errors='coerce')
+    df['year'] = df['date'].dt.isocalendar().year
+    df['week'] = df['date'].dt.isocalendar().week
+    
+    return df, headcounts
 
 def process_metrics(df, headcounts, alarm_type, depots, exclude_null_driver, only_completed):
     mask = (df['alarm_type'] == alarm_type) & (df['depot_id'].isin(depots)) & (df['depot_id'].notna())
@@ -329,7 +358,7 @@ def plot_prediction_bar(current, projected):
 # --- 7. AUTOMATION ---
 def trigger_power_automate(html_body, prediction):
     try:
-        # UPDATED: Use flat environment variable string, not nested dictionary
+        # Use flat environment variable
         url = get_config("POWER_AUTOMATE_FLOW_URL")
         
         if not url:
@@ -355,10 +384,12 @@ def main():
         st.markdown("### 🎛️ Control Panel")
         alarm = st.selectbox("Alarm Type", list(ALARM_MAP.keys()))
         
+        # Load Data with Smart Loader
         df, headcounts = load_data()
         
+        # Only stop if DF is totally empty (meaning load failed)
         if df.empty:
-            st.warning("⚠️ Data is waiting to be loaded. Please ensure CSV files are present.")
+            st.warning("⚠️ Data is waiting to be loaded. Please ensure TELEMATICS_URL is set in Azure.")
             st.stop()
             
         depot_opts = sorted(headcounts['depot_id'].unique())
