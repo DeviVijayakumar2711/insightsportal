@@ -17,20 +17,25 @@ except ImportError:
 # Load local .env file (for local development only)
 load_dotenv()
 
-# --- 1. CONFIGURATION HELPER (CRITICAL FOR AZURE) ---
+# --- 1. CONFIGURATION HELPER (FIXED TO SILENCE SECRETS ERROR) ---
 def get_config(key, default=""):
     """
-    Retrieves configuration from Azure Environment Variables first,
-    then Streamlit secrets (local), then defaults.
+    Retrieves configuration from Azure Environment Variables first.
+    Silences the 'No secrets file found' warning on Azure.
     """
-    # 1. Check OS Environment (Azure App Settings)
+    # 1. Check OS Environment (Azure App Settings) - PRIORITY
     val = os.environ.get(key)
     if val:
         return val
     
-    # 2. Check Streamlit Secrets (Local secrets.toml)
+    # 2. Check Streamlit Secrets (Local only)
+    # We wrap this in a specific try/except block to catch the FileNotFoundError
+    # which is what triggers the red UI error on Azure when secrets.toml is missing.
     try:
         return st.secrets.get(key, default)
+    except FileNotFoundError:
+        # Fail silently if no secrets.toml exists (normal on Azure)
+        pass
     except Exception:
         pass
         
