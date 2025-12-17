@@ -17,28 +17,27 @@ except ImportError:
 # Load local .env file (for local development only)
 load_dotenv()
 
-# --- 1. CONFIGURATION HELPER (FIXED TO SILENCE SECRETS ERROR) ---
+# --- 1. CONFIGURATION HELPER (ULTRA-SAFE FIX) ---
 def get_config(key, default=""):
     """
     Retrieves configuration from Azure Environment Variables first.
-    Silences the 'No secrets file found' warning on Azure.
+    Completely prevents 'No secrets file found' error by checking file existence first.
     """
     # 1. Check OS Environment (Azure App Settings) - PRIORITY
-    val = os.environ.get(key)
-    if val:
-        return val
+    # We check directly in os.environ to avoid touching st.secrets if possible
+    if key in os.environ:
+        return os.environ[key]
     
     # 2. Check Streamlit Secrets (Local only)
-    # We wrap this in a specific try/except block to catch the FileNotFoundError
-    # which is what triggers the red UI error on Azure when secrets.toml is missing.
-    try:
-        return st.secrets.get(key, default)
-    except FileNotFoundError:
-        # Fail silently if no secrets.toml exists (normal on Azure)
-        pass
-    except Exception:
-        pass
-        
+    # FIX: Check if the file actually exists using OS before accessing st.secrets.
+    # Accessing st.secrets when the file is missing triggers the Red UI Error immediately.
+    secrets_path = ".streamlit/secrets.toml"
+    if os.path.exists(secrets_path):
+        try:
+            return st.secrets.get(key, default)
+        except Exception:
+            pass
+            
     return default
 
 # --- 2. PAGE CONFIG & CSS ---
@@ -213,6 +212,7 @@ def load_data():
     """
     
     # 1. GET CONFIG (Use the filename from your screenshot as default)
+    # The default filenames are fallbacks if the Env Vars are missing
     path_tele = get_config("TELEMATICS_URL", "telematics_new_data_2207.csv")
     path_head = get_config("HEADCOUNTS_URL", "depot_headcounts.csv")
     path_excl = get_config("EXCLUSIONS_URL", "vehicle_exclusions.csv")
@@ -231,7 +231,7 @@ def load_data():
                 return pd.read_csv(path_str)
             except Exception as e:
                 if is_required:
-                    st.error(f"❌ Failed to read URL for {path_val}. Error: {e}")
+                    st.error(f"❌ **Azure Connection Error**: Failed to download data from URL.\nError: {e}")
                 return pd.DataFrame()
         
         # B) Is it a Local File?
@@ -240,7 +240,15 @@ def load_data():
                 return pd.read_csv(path_str)
             else:
                 if is_required:
-                    st.error(f"❌ Missing file: {path_str}. Please upload it or set the TELEMATICS_URL environment variable.")
+                    # Specific error to help user debug
+                    st.error(f"""
+                    ❌ **Data Load Error**
+                    
+                    The app looked for: `{path_str}`
+                    
+                    1. **If using Azure Blob Storage:** The `TELEMATICS_URL` environment variable is NOT being read, so the app fell back to looking for a local file. Please check your App Service Configuration.
+                    2. **If using Local Files:** The file is missing from the deployment zip.
+                    """)
                 return pd.DataFrame()
 
     # 2. LOAD
