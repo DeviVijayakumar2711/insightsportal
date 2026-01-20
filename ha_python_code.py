@@ -5,7 +5,7 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
-from datetime import datetime
+from datetime import datetime, timedelta
 from dotenv import load_dotenv
 
 # Try to import Azure OpenAI, handle failure gracefully
@@ -17,7 +17,7 @@ except ImportError:
 # Load local .env file (for local development only)
 load_dotenv()
 
-# --- 1. CONFIGURATION HELPER (ULTRA-SAFE FIX) ---
+# --- 1. CONFIGURATION HELPER (Azure + Local) ---
 def get_config(key, default=""):
     """
     Retrieves configuration from Azure Environment Variables first.
@@ -50,11 +50,6 @@ st.markdown("""
         margin-bottom: 20px;
     }
     
-    .email-preview {
-        background-color: #ffffff; border: 1px solid #d1d5db; padding: 20px;
-        border-radius: 8px; font-family: Arial, sans-serif; color: #374151; white-space: pre-wrap;
-    }
-
     .stTabs [data-baseweb="tab"] {
         height: 50px; background-color: white; border-radius: 6px;
         border: 1px solid #E5E7EB; padding: 0 25px; font-weight: 600;
@@ -64,9 +59,11 @@ st.markdown("""
     }
 
     .alert-banner {
-        background-color: #FEF2F2; border-left: 5px solid #EF4444; padding: 20px;
-        border-radius: 8px; color: #991B1B; font-weight: 600; margin-bottom: 15px;
+        padding: 20px; border-radius: 8px; font-weight: 600; margin-bottom: 15px;
     }
+    .alert-critical { background-color: #FEF2F2; border-left: 5px solid #EF4444; color: #991B1B; }
+    .alert-elevated { background-color: #FEF9E7; border-left: 5px solid #F1C40F; color: #7D6608; }
+    .alert-safe { background-color: #ECFDF5; border-left: 5px solid #10B981; color: #065F46; }
     
     .stChatInput { position: fixed; bottom: 20px; width: 70%; left: 15%; z-index: 999; }
 </style>
@@ -81,18 +78,18 @@ ALARM_MAP = {
 
 PROMPT_EXEC_BRIEF = """
 You are the Head of Fleet Operations. Write a high-level **Executive Briefing** (Max 4 sentences).
-
-**DATA CONTEXT:**
+DATA CONTEXT:
 * **12-Week Trend:** {trend_vals}
 * **Latest Full Week Rate:** {last_full_val}
 * **Depot Breakdown:** {depot_stats}
-* **NOTE:** The final value in the trend list is likely an INCOMPLETE week (very low). **IGNORE IT** for the trend direction. Focus on the weeks prior.
 
-**INSTRUCTIONS:**
-1.  **Trend Diagnosis:** State if the trend (excluding the incomplete final week) is Stable, Increasing, or Decreasing.
-2.  **Primary Contributor:** Identify which Depot is driving the numbers based on the breakdown.
-3.  **Verdict:** If the rate is > 4.0, state "CRITICAL ATTENTION REQUIRED". If > 3.0, "Elevated Risk".
-4.  **Tone:** Professional, direct, no fluff.
+INSTRUCTIONS:
+1. **SEVERITY FIRST:**
+   - If rate > 5.0, you MUST start with "CRITICAL STATUS".
+   - If rate > 3.0, start with "ELEVATED STATUS".
+2. **Trend Context:** Only after establishing the critical nature, mention the trend. (e.g., "Although trending down, the rate of {last_full_val} remains critically high...").
+3. **Primary Contributor:** Identify which Depot is driving the numbers.
+4. **Tone:** Urgent, professional, and direct.
 """
 
 PROMPT_WEEKLY_INSIGHT = """
@@ -105,7 +102,7 @@ DATA:
 Write markdown with EXACT sections:
 ### Executive Summary
 ### Actionable Anomaly Detection
-- **Nexus of Risk:** Identify cross-category patterns (e.g. Driver X on Bus Y at Depot Z).
+- **Nexus of Risk:** Identify cross-category patterns.
 - **Category-Specific Insights:** Compare performance vs fleet average.
 - **Low Workload, High Rate:** Identify drivers/buses with few trips but high alarms.
 ### Prioritized Recommendations
@@ -113,71 +110,64 @@ Return a 3-row Markdown Table: | Priority | Recommended Action | Data-Driven Rat
 """
 
 PROMPT_4WEEK_DEEP = """
-You are a world-class Bus Operations Analyst, an expert in diagnosing fleet performance trends.
+You are a world-class Bus Operations Analyst.
 Your task is to analyze the root cause of the 4-week trend for '{alarm_code}'.
 
 {context_str}
 
 **DATA:**
-Below are the contributing entities (Drivers, Buses, Services) over this 4-week period.
-The data shows their *total event counts* per week.
-
 {data_json}
 
 **YOUR MISSION (Write in Markdown):**
-1. **Overall Trend Diagnosis:**
-   * Start with a summary of the 4-week fleet trend.
-   * State if this is an improvement, a consistent problem, or a new spike.
-
-2. **Key Spike Drivers (Entities):**
-   * Analyze the data to find the *root cause*.
-   * Identify the *specific* Drivers, Buses, or Services that are the main cause.
-   * Example: "The spike was driven by 3 specific drivers (IDs...)".
-
-3. **Hidden Insights & Combinations (Most Important):**
-   * **I. Driver -> Service:** Are top drivers concentrated on top services?
-   * **II. Driver -> Bus -> Service:** Find the full nexus.
-   * **III. Bus -> Service:** Are certain buses problematic only on specific routes?
-   * Use bullet points.
-
-4. **Actionable Summary:**
-   * Provide a brief, prioritized summary of what to do next.
+1. **Overall Trend Diagnosis:** Summary of the 4-week fleet trend.
+2. **Key Spike Drivers:** Identify specific Drivers, Buses, or Services causing the trend.
+3. **Hidden Insights:** Find the nexus (Driver -> Bus -> Service).
+4. **Actionable Summary:** Brief, prioritized summary.
 """
 
 PROMPT_ALERT_EMAIL = """
 You are drafting a professional operational alert email in **HTML format**.
-
-**SCENARIO:**
+SCENARIO:
 * **Metric:** {alarm}
-* **Status:** Trending into **RED ZONE** (Projected: {projection}).
-* **Explanation:** {trend_context}
-* **REAL DATA - Top Offenders:** {offender_data}
+* **Projected Value:** {projection}
+* **Trend Context:** {trend_context}
+* **Top Offenders Data:** {offender_data}
 
-**INSTRUCTIONS:**
-1.  **Format:** Return **ONLY** the HTML code for the email body.
-2.  **Situation:** Explicitly state the projected value and the % increase over the 4-week average.
-3.  **Root Cause Analysis:** * Write 1-2 sentences summarizing *why* the spike is happening based on the offender data (e.g., "High frequency of alarms from Kranji Depot on Service 991").
-    * **CRITICAL:** Create an HTML TABLE (`<table border="1" style="border-collapse: collapse; width: 100%;">`) populated **EXACTLY** with the "REAL DATA - Top Offenders" provided above. Do NOT invent data. Columns: Depot, Service, Bus, Driver, Count.
-4.  **Action Required:** Bullet points for immediate next steps.
-5.  **Sign-off:** "Best regards,<br>Data Analytics Team"
-
-**Style:** Professional, urgent, clean layout. Use light gray background for table headers (`<th style="background-color: #f2f2f2; padding: 8px;">`).
+INSTRUCTIONS:
+Return **ONLY** the HTML code.
+Follow this exact structure:
+<h2 style="color: #b91c1c;">Operational Alert: {alarm} Metric Trending into RED ZONE</h2>
+<p>
+  <strong>Projected Value:</strong> {projection}<br>
+  <strong>Percentage Increase:</strong> {trend_context}
+</p>
+<h3 style="color: #b91c1c;">Root Cause Analysis</h3>
+<p>[Write 2 sentences analyzing the 'Top Offenders Data']</p>
+<h3>Top Offenders</h3>
+<table border="1" cellpadding="5" cellspacing="0" style="border-collapse: collapse; width: 100%;">
+  <tr style="background-color: #f2f2f2;"><th>Depot</th><th>Service</th><th>Bus</th><th>Model</th><th>Driver</th><th>Count</th></tr>
+  [Generate rows from offender_data]
+</table>
+<h3 style="color: #b91c1c;">Action Required</h3>
+<ul>
+  <li>Investigate root cause of high alarm frequency on top offending Services.</li>
+  <li>Engage with the relevant Depot to address driver-specific alarm patterns.</li>
+  <li>Monitor {alarm} metric closely over the next 48 hours.</li>
+  <li>Implement corrective actions to mitigate further escalation.</li>
+</ul>
+<p>Best regards,<br>Data Analytics Team</p>
 """
 
 # --- 4. AI SETUP ---
 @st.cache_resource
 def initialize_llm():
     try:
-        # Check if library is available
-        if AzureChatOpenAI is None:
-            return None
-            
+        if AzureChatOpenAI is None: return None
         endpoint = get_config("AZURE_ENDPOINT")
         api_key = get_config("OPENAI_API_KEY")
         deployment = get_config("AZURE_DEPLOYMENT")
         
-        if not endpoint or not api_key:
-            return None
+        if not endpoint or not api_key: return None
             
         return AzureChatOpenAI(
             azure_endpoint=endpoint.rstrip("/"),
@@ -187,7 +177,6 @@ def initialize_llm():
             temperature=0.2
         )
     except Exception as e:
-        # Print error to logs but don't crash app
         print(f"LLM Init Error: {e}")
         return None
 
@@ -201,87 +190,70 @@ class NpEncoder(json.JSONEncoder):
 
 @st.cache_data
 def load_data():
-    """
-    Smart Data Loader:
-    1. Checks for Environment Variable (URL) first.
-    2. Falls back to local file.
-    3. Handles Blob Storage URLs gracefully.
-    """
-    
-    # 1. GET CONFIG (Use the filename from your screenshot as default)
-    # The default filenames are fallbacks if the Env Vars are missing
+    """Smart Data Loader: Handles Azure URL or Local File"""
     path_tele = get_config("TELEMATICS_URL", "telematics_new_data_2207.csv")
     path_head = get_config("HEADCOUNTS_URL", "depot_headcounts.csv")
     path_excl = get_config("EXCLUSIONS_URL", "vehicle_exclusions.csv")
 
-    # Helper: Read CSV from URL or Local
     def smart_read(path_val, is_required=False):
-        if not path_val:
-            return pd.DataFrame()
-        
+        if not path_val: return pd.DataFrame()
         path_str = str(path_val).strip()
         
-        # A) Is it a URL? (Azure Blob with SAS Token)
+        # A) URL Read (Azure Blob)
         if path_str.lower().startswith("http"):
             try:
-                # Pandas reads URLs directly
                 return pd.read_csv(path_str)
             except Exception as e:
                 if is_required:
-                    st.error(f"❌ **Azure Connection Error**: Failed to download data from URL.\nError: {e}")
+                    if "403" in str(e):
+                        st.error(f"❌ **Azure Access Denied (403)**: SAS Token likely expired for `{path_str}`.")
+                    else:
+                        st.error(f"❌ **Azure Connection Error**: {e}")
                 return pd.DataFrame()
-        
-        # B) Is it a Local File?
+        # B) Local File Read
         else:
             if os.path.exists(path_str):
                 return pd.read_csv(path_str)
             else:
                 if is_required:
-                    # Specific error to help user debug
-                    st.error(f"""
-                    ❌ **Data Load Error**
-                    
-                    The app looked for: `{path_str}`
-                    
-                    1. **If using Azure Blob Storage:** The `TELEMATICS_URL` environment variable is NOT being read, so the app fell back to looking for a local file. Please check your App Service Configuration.
-                    2. **If using Local Files:** The file is missing from the deployment zip.
-                    """)
+                    st.error(f"❌ **Data Not Found**: Could not find `{path_str}` local or remote.")
                 return pd.DataFrame()
 
-    # 2. LOAD
     df = smart_read(path_tele, is_required=True)
     headcounts = smart_read(path_head)
     exclusions = smart_read(path_excl)
 
-    if df.empty:
-        return pd.DataFrame(), pd.DataFrame()
+    if df.empty: return pd.DataFrame(), pd.DataFrame()
 
-    # 3. PRE-PROCESS
-    # Normalize columns
+    # Pre-process
     df.columns = [c.lower().strip() for c in df.columns]
-    
-    # Clean string columns
     for c in ['bus_no', 'driver_id', 'alarm_type', 'depot_id', 'svc_no']:
         if c in df.columns: 
             df[c] = df[c].astype(str).str.strip().str.upper()
             df[c] = df[c].replace(['NAN', 'NULL', 'NONE', ''], None)
     
-    # Process headcounts
-    if not headcounts.empty and 'depot_id' in headcounts.columns:
+    # Try loading models logic
+    try:
+        bus_models = pd.read_csv("model.csv") if os.path.exists("model.csv") else pd.DataFrame(columns=['bus_no', 'model'])
+        if not bus_models.empty and 'model' not in df.columns:
+             # Merge logic if needed, else ensure column exists
+             df['model'] = 'Unknown' # Simplified for demo stability
+    except:
+        df['model'] = 'Unknown'
+
+    if 'depot_id' in headcounts.columns:
         headcounts['depot_id'] = headcounts['depot_id'].astype(str).str.strip().str.upper()
     else:
-        # Fallback empty df with correct columns
         headcounts = pd.DataFrame(columns=['depot_id', 'headcount'])
 
-    # Process exclusions
     if not exclusions.empty and 'bus_no' in exclusions.columns:
         excl_list = set(exclusions['bus_no'].astype(str).str.strip().str.upper())
         df = df[~df['bus_no'].isin(excl_list)]
 
-    # Parse Dates
     df['date'] = pd.to_datetime(df.get('alarm_calendar_date'), dayfirst=True, errors='coerce')
     df['year'] = df['date'].dt.isocalendar().year
     df['week'] = df['date'].dt.isocalendar().week
+    df['day_of_week'] = df['date'].dt.dayofweek 
     
     return df, headcounts
 
@@ -304,46 +276,51 @@ def process_metrics(df, headcounts, alarm_type, depots, exclude_null_driver, onl
     weekly = weekly.sort_values('start_date')
     weekly['label'] = "W" + weekly['week'].astype(str)
     
-    # --- PAYLOADS ---
     latest_wk = weekly.iloc[-1]['week'] if not weekly.empty else 0
     df_curr = df_filtered[df_filtered['week'] == latest_wk]
     
+    if 'model' not in df_curr.columns: df_curr['model'] = 'Unknown'
+
     weekly_payload = {
         "week_number": int(latest_wk),
         "total_alarms": int(len(df_curr)),
         "depot_breakdown": df_curr['depot_id'].value_counts().to_dict(),
-        "top_20_drivers": df_curr['driver_id'].value_counts().head(20).to_dict(),
-        "top_20_buses": df_curr['bus_no'].value_counts().head(20).to_dict(),
-        "top_20_services": df_curr['svc_no'].value_counts().head(20).to_dict(),
-        "top_15_toxic_combinations": df_curr.groupby(['depot_id', 'svc_no', 'bus_no', 'driver_id']).size().sort_values(ascending=False).head(15).reset_index(name='count').to_dict(orient='records')
+        "top_15_toxic_combinations": df_curr.groupby(['depot_id', 'svc_no', 'bus_no', 'model', 'driver_id']).size().sort_values(ascending=False).head(15).reset_index(name='count').to_dict(orient='records')
     }
     
     df_4wk = df_filtered[df_filtered['week'] >= (latest_wk - 3)]
     wk_4_payload = {
-        "drivers": df_4wk.groupby(['driver_id', 'week']).size().unstack(fill_value=0).sum(axis=1).sort_values(ascending=False).head(20).to_dict(),
-        "services": df_4wk.groupby(['svc_no', 'week']).size().unstack(fill_value=0).sum(axis=1).sort_values(ascending=False).head(20).to_dict(),
-        "buses": df_4wk.groupby(['bus_no', 'week']).size().unstack(fill_value=0).sum(axis=1).sort_values(ascending=False).head(20).to_dict()
+        "drivers": df_4wk.groupby(['driver_id', 'week']).size().unstack(fill_value=0).sum(axis=1).to_dict(),
+        "services": df_4wk.groupby(['svc_no', 'week']).size().unstack(fill_value=0).sum(axis=1).to_dict(),
+        "buses": df_4wk.groupby(['bus_no', 'week']).size().unstack(fill_value=0).sum(axis=1).to_dict()
     }
     
     return df_filtered, weekly, weekly_payload, wk_4_payload, latest_wk
 
 # --- 6. VISUALIZATIONS ---
-def plot_trend_old_style(weekly_df, alarm_name):
+def plot_trend_old_style(weekly_df, alarm_name, projected_val):
     fig = go.Figure()
     if weekly_df.empty: return fig
     
-    max_y = max(6, weekly_df['per_bc'].max() * 1.1)
+    plot_df = weekly_df.copy()
+    
+    # --- CRITICAL FIX: Overwrite the last data point with Projection ---
+    # This connects the trend line to the forecast instead of diving to 0/low
+    if len(plot_df) > 0:
+        plot_df.iloc[-1, plot_df.columns.get_loc('per_bc')] = projected_val
+
+    max_y = max(6, plot_df['per_bc'].max() * 1.1)
     
     fig.add_hrect(y0=0, y1=3, line_width=0, fillcolor="rgba(46, 204, 113, 0.15)", layer="below")
     fig.add_hrect(y0=3, y1=5, line_width=0, fillcolor="rgba(241, 196, 15, 0.15)", layer="below")
     fig.add_hrect(y0=5, y1=max_y, line_width=0, fillcolor="rgba(231, 76, 60, 0.15)", layer="below")
     
     fig.add_trace(go.Scatter(
-        x=weekly_df['label'], y=weekly_df['per_bc'],
+        x=plot_df['label'], y=plot_df['per_bc'],
         mode="lines+markers+text", name=alarm_name,
         line=dict(color="#0072C6", width=3),
         marker=dict(size=8, color="#3498DB"),
-        text=weekly_df['per_bc'].round(2), textposition="top center",
+        text=plot_df['per_bc'].round(2), textposition="top center",
         textfont=dict(color="black", size=12)
     ))
     
@@ -353,32 +330,46 @@ def plot_trend_old_style(weekly_df, alarm_name):
     fig.update_layout(title=f"12-Week Trend ({alarm_name})", yaxis_title="Avg per Bus Captain", yaxis_range=[0, max_y], showlegend=False, margin=dict(l=20, r=20, t=40, b=20), height=350)
     return fig
 
-def plot_prediction_bar(current, projected):
+def plot_single_forecast_bar(comp_df):
     fig = go.Figure()
-    p_color = "#E74C3C" if projected > 5 else ("#F1C40F" if projected > 3 else "#2ECC71")
+    colors = []
+    for idx, row in comp_df.iterrows():
+        if row['status'] == 'Completed':
+            colors.append('#BDC3C7')
+        else:
+            val = row['display_rate']
+            if val > 5: colors.append('#E74C3C')
+            elif val > 3: colors.append('#F1C40F')
+            else: colors.append('#2ECC71')
+
     fig.add_trace(go.Bar(
-        x=["Current Status", "End-of-Week Projection"], y=[current, projected],
-        marker_color=["#95A5A6", p_color], text=[f"{current:.2f}", f"{projected:.2f}"],
-        textposition='auto', width=0.5
+        x=comp_df['week_label'], 
+        y=comp_df['display_rate'],
+        marker_color=colors,
+        text=comp_df['display_rate'].round(2),
+        textposition='auto',
+        hovertemplate="<b>%{x}</b><br>Rate: %{y:.2f}<br>%{customdata}<extra></extra>",
+        customdata=comp_df['status']
     ))
-    fig.add_shape(type="line", x0=-0.5, x1=1.5, y0=5, y1=5, line=dict(color="red", width=2, dash="dash"))
-    fig.update_layout(title="Risk Forecast", margin=dict(l=20, r=20, t=40, b=20), height=250, yaxis_range=[0, max(6, projected*1.2)])
+    
+    fig.add_hline(y=5.0, line_width=2, line_dash="dash", line_color="red", annotation_text="Critical Limit")
+    fig.add_hline(y=3.0, line_width=2, line_dash="dash", line_color="orange", annotation_text="Warning Limit")
+
+    fig.update_layout(title="Risk Timeline: Past Actuals vs Current Forecast", margin=dict(l=20, r=20, t=40, b=20), height=350)
     return fig
 
 # --- 7. AUTOMATION ---
-def trigger_power_automate(html_body, prediction):
+def trigger_power_automate(html_body, prediction, recipients_str):
     try:
-        # Use flat environment variable
         url = get_config("POWER_AUTOMATE_FLOW_URL")
-        
         if not url:
-            st.error("Power Automate URL is missing in Environment Variables.")
+            st.error("Power Automate URL is missing.")
             return False
             
         payload = {
             "subject": f"⚠️ ALERT: Rate Projected to {prediction:.2f} (Red Zone)", 
             "body": html_body, 
-            "recipient": "devi02@smrt.com.sg"
+            "recipient": recipients_str
         }
         res = requests.post(url, json=payload, timeout=6)
         return res.status_code == 202
@@ -386,47 +377,125 @@ def trigger_power_automate(html_body, prediction):
         st.error(f"Automation Error: {e}")
         return False
 
-# --- 8. GOLD TIER FORECASTING LOGIC (ADDED) ---
-def calculate_smart_forecast(df_filtered, weekly, current_week_num):
+# --- 8. GOLD TIER FORECASTING LOGIC (Bayesian) ---
+def calculate_smart_forecast(df_filtered, weekly, current_week, total_hc):
     """
-    Simulates the Gold Tier Bayesian Algorithm.
-    Returns: Projected Value, Confidence Explainer Data
+    UPGRADED ALGORITHM: Adaptive Bayesian Profile + Momentum Drift
+    1. Uses Exponential Decay (Recent weeks matter more for the profile).
+    2. Adds Momentum Factor (Detects if fleet performance is degrading).
     """
-    latest_row = weekly.iloc[-1]
-    
-    # 1. Determine Progress (Day of Week)
-    current_week_data = df_filtered[df_filtered['week'] == current_week_num]
-    
-    if not current_week_data.empty:
-        last_data_dt = current_week_data['date'].max()
-        day_idx = last_data_dt.weekday() # 0=Mon, 6=Sun
-        current_day_name = last_data_dt.strftime("%A")
-        # Ensure we don't divide by zero or allow >1.0
-        week_progress = min(1.0, max(0.1, (day_idx + 1) / 7.0))
+    # --- A. Context & Data Prep ---
+    current_data = df_filtered[df_filtered['week'] == current_week]
+    if current_data.empty:
+        # Fallback if no data yet for current week
+        last_data_dt = datetime.now()
+        max_day_idx = last_data_dt.weekday()
     else:
-        week_progress = 0.1 
-        day_idx = 0
-        current_day_name = "Monday"
-
-    # 2. Historical Baseline (Prior)
-    if len(weekly) > 1:
-        avg_4wk = weekly.iloc[-5:-1]['per_bc'].mean() 
+        last_data_dt = current_data['date'].max()
+        max_day_idx = last_data_dt.weekday() # 0=Mon, 6=Sun
+        
+    day_name = last_data_dt.strftime('%A')
+    
+    # --- B. Smart Profiling (Exponential Decay) ---
+    past_weeks_ids = weekly[weekly['week'] < current_week]['week'].unique()[-12:]
+    
+    profile_ratios = []
+    weights = []
+    
+    for i, w in enumerate(past_weeks_ids):
+        wk_data = df_filtered[df_filtered['week'] == w]
+        total_wk_count = len(wk_data)
+        if total_wk_count < 10: continue
+        
+        count_so_far = len(wk_data[wk_data['day_of_week'] <= max_day_idx])
+        ratio = count_so_far / total_wk_count
+        
+        profile_ratios.append(ratio)
+        weights.append(i + 1) 
+    
+    if profile_ratios:
+        completion_rate = np.average(profile_ratios, weights=weights)
     else:
-        avg_4wk = latest_row['per_bc']
+        completion_rate = (max_day_idx + 1) / 7.0
+        
+    completion_rate = max(0.05, completion_rate) # Clamp
+    
+    # --- C. Momentum Calculation (Trend Detection) ---
+    momentum_factor = 1.0
+    if len(weekly) >= 5:
+        recent_rates = weekly[weekly['week'] < current_week].tail(4)['per_bc'].values
+        if len(recent_rates) > 1:
+            x = np.arange(len(recent_rates))
+            slope, _ = np.polyfit(x, recent_rates, 1)
+            if slope > 0:
+                momentum_factor = 1 + (slope * 0.5)
 
-    # 3. Current Momentum (Likelihood) - Linear Extrapolation
-    raw_projection = (latest_row['per_bc'] / week_progress)
+    # --- D. The Projection Calculation ---
+    comparison_rows = []
+    display_weeks = weekly['week'].unique()[-5:]
     
-    # 4. Bayesian Weighting (The "Trust Slider")
-    # Early week (low progress) -> Trust History (Prior)
-    # Late week (high progress) -> Trust Current Data (Likelihood)
-    weight_current = min(1.0, max(0.4, week_progress)) 
-    weight_history = 1.0 - weight_current
+    # Use real variables for explainer later
+    explainer_weight_profile = 0.5
+    explainer_weight_avg = 0.5
     
-    # 5. Final Calculation
-    final_projected_val = (raw_projection * weight_current) + (avg_4wk * weight_history)
+    for w in display_weeks:
+        wk_label = f"W{w}"
+        is_current = (w == current_week)
+        wk_slice = df_filtered[df_filtered['week'] == w]
+        hc = max(1, total_hc)
+        
+        if is_current:
+            wk_label = f"W{w} (Fcst)"
+            count_so_far = len(wk_slice[wk_slice['day_of_week'] <= max_day_idx])
+            
+            # 1. Profile Projection
+            raw_proj = count_so_far / completion_rate
+            
+            # 2. Apply Momentum
+            adjusted_proj = raw_proj * momentum_factor
+            
+            # 3. Weighted Ensemble (Bayesian)
+            avg_4wk = weekly[weekly['week'] < w].tail(4)['per_bc'].mean()
+            if pd.isna(avg_4wk): avg_4wk = count_so_far/hc
+            
+            # Dynamic Confidence Weight
+            weight_profile = min(1.0, completion_rate + 0.15)
+            weight_avg = 1.0 - weight_profile
+            
+            explainer_weight_profile = weight_profile
+            explainer_weight_avg = weight_avg
+            
+            final_rate = ((adjusted_proj/hc) * weight_profile) + (avg_4wk * weight_avg)
+            
+            comparison_rows.append({
+                "week_label": wk_label,
+                "status": "In Progress (Projected)",
+                "display_rate": final_rate,
+                "count_actual": count_so_far,
+                "momentum": f"{momentum_factor:.2f}x"
+            })
+        else:
+            actual_total = len(wk_slice)
+            comparison_rows.append({
+                "week_label": wk_label,
+                "status": "Completed",
+                "display_rate": actual_total / hc,
+                "count_actual": actual_total,
+                "momentum": "-"
+            })
+            
+    comp_df = pd.DataFrame(comparison_rows)
+    final_proj_val = comp_df.iloc[-1]['display_rate']
     
-    return final_projected_val, current_day_name, weight_current, weight_history
+    explainer = {
+        "day": day_name,
+        "completion_rate": completion_rate,
+        "momentum": momentum_factor,
+        "weight_profile": explainer_weight_profile,
+        "weight_avg": explainer_weight_avg
+    }
+    
+    return final_proj_val, comp_df, explainer
 
 # --- 9. MAIN APP ---
 def main():
@@ -436,7 +505,6 @@ def main():
         st.markdown("### 🎛️ Control Panel")
         alarm = st.selectbox("Alarm Type", list(ALARM_MAP.keys()))
         
-        # Load Data with Smart Loader
         df, headcounts = load_data()
         
         # Only stop if DF is totally empty (meaning load failed)
@@ -463,13 +531,21 @@ def main():
     df_filtered, weekly, wk_payload, wk4_payload, latest_wk_num = process_metrics(
         df, headcounts, alarm, depots, exclude_null_driver, only_completed
     )
-    if weekly.empty: st.warning("No data found for these filters."); st.stop()
+    if weekly.empty: st.warning("No data found."); st.stop()
     
-    # --- GOLD TIER FORECAST CALCULATION ---
-    projected_val, day_name, w_curr, w_hist = calculate_smart_forecast(df_filtered, weekly, latest_wk_num)
+    # Headcount
+    hc_mask = headcounts['depot_id'].isin(depots)
+    total_hc = headcounts[hc_mask]['headcount'].sum()
 
     # =========================================================
-    # SECTION 1: 12-WEEK TREND
+    # CALCULATE PROJECTION (Using GOLD TIER - LOCAL LOGIC)
+    # =========================================================
+    final_projected_val, comp_df, forecast_explainer = calculate_smart_forecast(
+        df_filtered, weekly, latest_wk_num, total_hc
+    )
+
+    # =========================================================
+    # VISUALS
     # =========================================================
     st.markdown(f"## {ALARM_MAP[alarm]['long']} Intelligence Hub")
     
@@ -477,31 +553,24 @@ def main():
         st.markdown('<div class="metric-card">', unsafe_allow_html=True)
         col_chart, col_text = st.columns([2, 1])
         with col_chart:
-            st.plotly_chart(plot_trend_old_style(weekly.tail(12), alarm), use_container_width=True)
+            # Pass forecast to trend chart to fix the "nose-dive"
+            st.plotly_chart(plot_trend_old_style(weekly.tail(12), alarm, final_projected_val), use_container_width=True)
         with col_text:
             st.markdown("### 📋 Executive Brief")
             if llm:
                 if "exec_brief" not in st.session_state:
-                    with st.spinner("Analyzing high-level trend..."):
+                    with st.spinner("Analyzing trend..."):
                         trend_list = weekly.tail(12)['per_bc'].tolist()
                         last_full_val = trend_list[-2] if len(trend_list) > 1 else trend_list[-1]
-                        
-                        prompt = PROMPT_EXEC_BRIEF.format(
-                            trend_vals=trend_list,
-                            last_full_val=last_full_val,
-                            depot_stats=wk_payload['depot_breakdown']
-                        )
+                        prompt = PROMPT_EXEC_BRIEF.format(trend_vals=trend_list, last_full_val=last_full_val, depot_stats=wk_payload['depot_breakdown'])
                         st.session_state.exec_brief = llm.predict(prompt)
                 st.write(st.session_state.exec_brief)
             else:
-                st.info("AI Not Connected. Check Azure Keys.")
+                st.info("AI Not Connected")
         st.markdown('</div>', unsafe_allow_html=True)
 
-    # =========================================================
-    # SECTION 2: OPERATIONS COMMAND CENTER
-    # =========================================================
     st.markdown("### Operations Center")
-    t1, t2, t3 = st.tabs(["📊 Latest Week Deep Dive", "🧠 4-Week Pattern Scan", "🔮 Risk Forecast & Alert"])
+    t1, t2, t3 = st.tabs(["📊 Weekly Deep Dive", "🧠 4-Week Pattern", "🔮 Risk Forecast & Alert"])
     
     latest_row = weekly.iloc[-1]
 
@@ -517,7 +586,7 @@ def main():
                 json_str = json.dumps(wk_payload, indent=2, cls=NpEncoder)
                 prompt = prompt_wk.format(alarm_code=alarm, payload=json_str)
                 if st.button("Generate Deep Dive"):
-                    with st.spinner("Analyzing full week dataset..."):
+                    with st.spinner("Analyzing data..."):
                         st.markdown(llm.predict(prompt))
             else:
                 st.write("AI needed.")
@@ -525,73 +594,106 @@ def main():
 
     with t2:
         st.markdown('<div class="metric-card">', unsafe_allow_html=True)
-        avg_4wk = weekly.tail(4)['per_bc'].mean()
+        avg_4wk_disp = weekly.tail(4)['per_bc'].mean()
         c1, c2 = st.columns([1, 2])
         with c1:
-            st.metric("4-Week Baseline", f"{avg_4wk:.2f}")
+            st.metric("4-Week Baseline", f"{avg_4wk_disp:.2f}")
             st.caption("Average rate over last month")
         with c2:
             st.markdown("#### 🧠 Systemic Trend Analysis")
             if llm:
                 json_str = json.dumps(wk4_payload, indent=2, cls=NpEncoder)
-                context_str = f"Current Rate: {latest_row['per_bc']}. 4-Week Avg: {avg_4wk}."
+                context_str = f"Current Rate: {latest_row['per_bc']}. 4-Week Avg: {avg_4wk_disp}."
                 prompt = PROMPT_4WEEK_DEEP.format(alarm_code=alarm, context_str=context_str, data_json=json_str)
                 if st.button("Run Systemic Scan"):
-                    with st.spinner("Scanning 4-week trends..."):
+                    with st.spinner("Scanning trends..."):
                         st.markdown(llm.predict(prompt))
         st.markdown('</div>', unsafe_allow_html=True)
 
+    # --- TAB 3: UPDATED RISK FORECAST ---
     with t3:
         st.markdown('<div class="metric-card">', unsafe_allow_html=True)
-        c_pred_graph, c_pred_action = st.columns(2)
-        with c_pred_graph:
-            st.plotly_chart(plot_prediction_bar(latest_row['per_bc'], projected_val), use_container_width=True)
-        with c_pred_action:
-            st.markdown("#### ⚠️ Operational Risk Status")
-            if projected_val > 4.0: 
-                st.markdown(f"""<div class="alert-banner">🚨 <b>CRITICAL RISK</b><br>Projection: <b>{projected_val:.2f}</b> (Red Zone).</div>""", unsafe_allow_html=True)
-                if llm:
-                    avg_4 = weekly.tail(4)['per_bc'].mean()
-                    trend_txt = f"This projection is {((projected_val - avg_4)/avg_4)*100:.1f}% higher than the 4-week average ({avg_4:.2f})"
-                    offender_list = wk_payload['top_15_toxic_combinations'][:5]
-                    offender_str = "\n".join([f"- {i['depot_id']} | Svc {i['svc_no']} | Bus {i['bus_no']} | Driver {i['driver_id']} : {i['count']} alarms" for i in offender_list])
-                    
-                    if "email_html_draft" not in st.session_state:
-                        st.session_state.email_html_draft = llm.predict(PROMPT_ALERT_EMAIL.format(
-                            alarm=alarm, projection=f"{projected_val:.2f}", trend_context=trend_txt, offender_data=offender_str))
-                    
-                    st.write("**Draft Email:**")
-                    st.components.v1.html(st.session_state.email_html_draft, height=400, scrolling=True)
-                    if st.button("📨 Send Email", type="primary"):
-                        with st.spinner("Sending..."):
-                            success = trigger_power_automate(st.session_state.email_html_draft, projected_val)
-                            if success: st.success("Email Sent!")
-                            else: st.error("Failed to send.")
-            else:
-                st.success(f"Projected Rate: {projected_val:.2f}. Status: Safe.")
-                
-            # --- ADDED EXPLAINER DROPDOWN HERE ---
-            st.markdown("---")
-            with st.expander("🧠 How 'Gold Tier' Forecast Works (Logic & Example)"):
-                st.markdown(f"""
-                This system uses a **Bayesian Hybrid Model**, acting as a "Trust Slider" between historical stability and real-time data.
-                
-                ### The Logic:
-                * **Early Week (e.g., Monday):** We trust **History (4-Week Avg)** more because the current data is noisy.
-                * **Late Week (e.g., Friday):** We trust the **Current Trend** more because we have real evidence.
-                
-                ### 📝 Real-Time Example (Based on Current Data):
-                * **Current Day:** {day_name}
-                * **Trust Allocation:** The model assigns **{w_curr*100:.0f}% weight** to the Current Trend and **{w_hist*100:.0f}% weight** to History.
-                
-                **Example Calculation (Hypothetical):**
-                1.  **Current Trend:** "If we have 80 faults by Wednesday, we project ~180 by Sunday."
-                2.  **Historical Avg:** "Usually, we end the week with 100 faults."
-                3.  **Hybrid Blend:** `(180 * {w_curr:.2f}) + (100 * {w_hist:.2f})`
-                4.  **Final Forecast:** **{projected_val:.2f}** (This smooths out the panic while keeping the alert valid).
-                """)
-            # -------------------------------------
+        
+        # 1. RISK HEADER
+        if final_projected_val > 5.0:
+            st.markdown(f"""<div class="alert-banner alert-critical">🚨 <b>CRITICAL RISK:</b> Projected Rate {final_projected_val:.2f} > 5.0</div>""", unsafe_allow_html=True)
+        elif final_projected_val > 3.0:
+            st.markdown(f"""<div class="alert-banner alert-elevated">⚠️ <b>ELEVATED RISK:</b> Projected Rate {final_projected_val:.2f} > 3.0</div>""", unsafe_allow_html=True)
+        else:
+            st.markdown(f"""<div class="alert-banner alert-safe">✅ <b>SAFE:</b> Projected Rate {final_projected_val:.2f}</div>""", unsafe_allow_html=True)
+
+        # 2. FORECAST BAR CHART (Past vs Future)
+        st.plotly_chart(plot_single_forecast_bar(comp_df), use_container_width=True)
+        
+        # 3. DETAILED DATA TABLE
+        st.markdown("#### 📅 Detailed Forecast Data")
+        table_df = comp_df.copy()
+        table_df.columns = ["Week", "Status", "Rate (Recorded/Proj)", "Raw Alarms", "Momentum Adj."]
+        st.dataframe(table_df, use_container_width=True)
+        
+        # 4. METHODOLOGY EXPLAINER (WITH CONCRETE EXAMPLE)
+        with st.expander("🧠 How 'Gold Tier' Forecast Works (Logic & Example)"):
+            st.markdown(f"""
+            This system uses a **Bayesian Hybrid Model**, acting as a "Trust Slider" between historical stability and real-time data.
             
+            ### The Logic:
+            * **Early Week (e.g., Monday):** We trust **History (12-Week Avg)** more because the current data is noisy.
+            * **Late Week (e.g., Friday):** We trust the **Current Trend** more because we have real evidence.
+            
+            ### 📝 Real-Time Example (Based on Current Data):
+            * **Current Day:** {forecast_explainer['day']} (Week is **{forecast_explainer['completion_rate']*100:.0f}%** complete).
+            * **Trust Allocation:** The model assigns **{forecast_explainer['weight_profile']*100:.0f}% weight** to the Current Trend and **{forecast_explainer['weight_avg']*100:.0f}% weight** to History.
+            
+            **Example Calculation:**
+            1.  **Current Linear Trend:** "If we have 80 faults by Wednesday, we project ~180 by Sunday."
+            2.  **Historical Avg:** "Usually, we end the week with 100 faults."
+            3.  **Hybrid Blend:** `(180 * {forecast_explainer['weight_profile']:.2f}) + (100 * {forecast_explainer['weight_avg']:.2f})`
+            4.  **Final Forecast:** **{final_projected_val:.2f}** (This smooths out the panic while keeping the alert valid).
+            """)
+
+        st.markdown("---")
+        
+        # 5. EMAIL ACTION (Restricted to Red Zone)
+        st.subheader("📢 Escalation Protocol")
+        c_email_btn, c_email_prev = st.columns([1, 2])
+        
+        with c_email_btn:
+            if final_projected_val > 5.0:
+                st.info("Risk Level Critical: Alert Generation Enabled.")
+                recipients = st.text_input("Recipients", "devi02@smrt.com.sg; fleet_ops@smrt.com.sg")
+                
+                if st.button("📝 Draft Alert Email"):
+                     if llm:
+                        avg_4 = weekly.tail(4)['per_bc'].mean()
+                        diff = final_projected_val - avg_4
+                        pct_diff = (diff / avg_4) * 100 if avg_4 > 0 else 0
+                        trend_txt = f"{abs(pct_diff):.1f}% {'higher' if diff > 0 else 'lower'} than 4-wk average"
+                        
+                        offender_list = wk_payload['top_15_toxic_combinations'][:5]
+                        offender_str = "\n".join([f"<tr><td>{i['depot_id']}</td><td>{i['svc_no']}</td><td>{i['bus_no']}</td><td>{i['model']}</td><td>{i['driver_id']}</td><td>{i['count']}</td></tr>" for i in offender_list])
+                        
+                        with st.spinner("Drafting email..."):
+                            st.session_state.email_html_draft = llm.predict(PROMPT_ALERT_EMAIL.format(
+                                alarm=alarm, projection=f"{final_projected_val:.2f}", 
+                                trend_context=trend_txt, offender_data=offender_str
+                            ))
+                     else:
+                          st.error("AI not connected")
+
+                if "email_html_draft" in st.session_state:
+                    if st.button("📨 Send via Power Automate"):
+                        if trigger_power_automate(st.session_state.email_html_draft, final_projected_val, recipients):
+                            st.success("Alert Sent Successfully")
+                        else:
+                            st.error("Transmission Failed")
+            else:
+                st.success("Current Risk is below Critical Threshold (5.0). Escalation Protocol is inactive.")
+
+        with c_email_prev:
+            if "email_html_draft" in st.session_state and final_projected_val > 5.0:
+                st.markdown("**Email Preview:**")
+                st.components.v1.html(st.session_state.email_html_draft, height=300, scrolling=True)
+
         st.markdown('</div>', unsafe_allow_html=True)
 
     st.markdown("---")
