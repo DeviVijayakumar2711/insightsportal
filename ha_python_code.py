@@ -24,13 +24,10 @@ def get_config(key, default=""):
     Completely prevents 'No secrets file found' error by checking file existence first.
     """
     # 1. Check OS Environment (Azure App Settings) - PRIORITY
-    # We check directly in os.environ to avoid touching st.secrets if possible
     if key in os.environ:
         return os.environ[key]
     
     # 2. Check Streamlit Secrets (Local only)
-    # FIX: Check if the file actually exists using OS before accessing st.secrets.
-    # Accessing st.secrets when the file is missing triggers the Red UI Error immediately.
     secrets_path = ".streamlit/secrets.toml"
     if os.path.exists(secrets_path):
         try:
@@ -389,7 +386,49 @@ def trigger_power_automate(html_body, prediction):
         st.error(f"Automation Error: {e}")
         return False
 
-# --- 8. MAIN APP ---
+# --- 8. GOLD TIER FORECASTING LOGIC (ADDED) ---
+def calculate_smart_forecast(df_filtered, weekly, current_week_num):
+    """
+    Simulates the Gold Tier Bayesian Algorithm.
+    Returns: Projected Value, Confidence Explainer Data
+    """
+    latest_row = weekly.iloc[-1]
+    
+    # 1. Determine Progress (Day of Week)
+    current_week_data = df_filtered[df_filtered['week'] == current_week_num]
+    
+    if not current_week_data.empty:
+        last_data_dt = current_week_data['date'].max()
+        day_idx = last_data_dt.weekday() # 0=Mon, 6=Sun
+        current_day_name = last_data_dt.strftime("%A")
+        # Ensure we don't divide by zero or allow >1.0
+        week_progress = min(1.0, max(0.1, (day_idx + 1) / 7.0))
+    else:
+        week_progress = 0.1 
+        day_idx = 0
+        current_day_name = "Monday"
+
+    # 2. Historical Baseline (Prior)
+    if len(weekly) > 1:
+        avg_4wk = weekly.iloc[-5:-1]['per_bc'].mean() 
+    else:
+        avg_4wk = latest_row['per_bc']
+
+    # 3. Current Momentum (Likelihood) - Linear Extrapolation
+    raw_projection = (latest_row['per_bc'] / week_progress)
+    
+    # 4. Bayesian Weighting (The "Trust Slider")
+    # Early week (low progress) -> Trust History (Prior)
+    # Late week (high progress) -> Trust Current Data (Likelihood)
+    weight_current = min(1.0, max(0.4, week_progress)) 
+    weight_history = 1.0 - weight_current
+    
+    # 5. Final Calculation
+    final_projected_val = (raw_projection * weight_current) + (avg_4wk * weight_history)
+    
+    return final_projected_val, current_day_name, weight_current, weight_history
+
+# --- 9. MAIN APP ---
 def main():
     llm = initialize_llm()
     
@@ -426,9 +465,8 @@ def main():
     )
     if weekly.empty: st.warning("No data found for these filters."); st.stop()
     
-    latest_row = weekly.iloc[-1]
-    # Simple projection logic
-    projected_val = (latest_row['per_bc'] / (df_filtered['date'].max().weekday() + 1)) * 7
+    # --- GOLD TIER FORECAST CALCULATION ---
+    projected_val, day_name, w_curr, w_hist = calculate_smart_forecast(df_filtered, weekly, latest_wk_num)
 
     # =========================================================
     # SECTION 1: 12-WEEK TREND
@@ -465,6 +503,8 @@ def main():
     st.markdown("### Operations Center")
     t1, t2, t3 = st.tabs(["📊 Latest Week Deep Dive", "🧠 4-Week Pattern Scan", "🔮 Risk Forecast & Alert"])
     
+    latest_row = weekly.iloc[-1]
+
     with t1:
         st.markdown('<div class="metric-card">', unsafe_allow_html=True)
         c1, c2 = st.columns([1, 2])
@@ -529,6 +569,29 @@ def main():
                             else: st.error("Failed to send.")
             else:
                 st.success(f"Projected Rate: {projected_val:.2f}. Status: Safe.")
+                
+            # --- ADDED EXPLAINER DROPDOWN HERE ---
+            st.markdown("---")
+            with st.expander("🧠 How 'Gold Tier' Forecast Works (Logic & Example)"):
+                st.markdown(f"""
+                This system uses a **Bayesian Hybrid Model**, acting as a "Trust Slider" between historical stability and real-time data.
+                
+                ### The Logic:
+                * **Early Week (e.g., Monday):** We trust **History (4-Week Avg)** more because the current data is noisy.
+                * **Late Week (e.g., Friday):** We trust the **Current Trend** more because we have real evidence.
+                
+                ### 📝 Real-Time Example (Based on Current Data):
+                * **Current Day:** {day_name}
+                * **Trust Allocation:** The model assigns **{w_curr*100:.0f}% weight** to the Current Trend and **{w_hist*100:.0f}% weight** to History.
+                
+                **Example Calculation (Hypothetical):**
+                1.  **Current Trend:** "If we have 80 faults by Wednesday, we project ~180 by Sunday."
+                2.  **Historical Avg:** "Usually, we end the week with 100 faults."
+                3.  **Hybrid Blend:** `(180 * {w_curr:.2f}) + (100 * {w_hist:.2f})`
+                4.  **Final Forecast:** **{projected_val:.2f}** (This smooths out the panic while keeping the alert valid).
+                """)
+            # -------------------------------------
+            
         st.markdown('</div>', unsafe_allow_html=True)
 
     st.markdown("---")
