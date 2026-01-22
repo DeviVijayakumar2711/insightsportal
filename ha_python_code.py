@@ -232,14 +232,25 @@ def load_data():
             df[c] = df[c].astype(str).str.strip().str.upper()
             df[c] = df[c].replace(['NAN', 'NULL', 'NONE', ''], None)
     
-    # Try loading models logic
+    # --- MODEL LOADING LOGIC (MATCHING LOCAL CODE) ---
     try:
-        bus_models = pd.read_csv("model.csv") if os.path.exists("model.csv") else pd.DataFrame(columns=['bus_no', 'model'])
-        if not bus_models.empty and 'model' not in df.columns:
-             # Merge logic if needed, else ensure column exists
-             df['model'] = 'Unknown' # Simplified for demo stability
-    except:
-        df['model'] = 'Unknown'
+        # NOTE: model.csv must be in the deployment zip for this to work
+        bus_models = pd.read_csv("model.csv")
+        
+        # Clean columns
+        bus_models.columns = [c.lower().strip() for c in bus_models.columns]
+        if 'bus_number' in bus_models.columns:
+            bus_models.rename(columns={'bus_number': 'bus_no'}, inplace=True)
+        
+        # Merge logic
+        if 'bus_no' in bus_models.columns:
+            bus_models['bus_no'] = bus_models['bus_no'].astype(str).str.strip().str.upper()
+            if 'model' in bus_models.columns:
+                df = df.merge(bus_models[['bus_no', 'model']], on='bus_no', how='left')
+                df['model'] = df['model'].fillna('Unknown')
+    except Exception:
+        # Fallback if model.csv is missing
+        if 'model' not in df.columns: df['model'] = 'Unknown'
 
     if 'depot_id' in headcounts.columns:
         headcounts['depot_id'] = headcounts['depot_id'].astype(str).str.strip().str.upper()
@@ -298,29 +309,23 @@ def process_metrics(df, headcounts, alarm_type, depots, exclude_null_driver, onl
     return df_filtered, weekly, weekly_payload, wk_4_payload, latest_wk
 
 # --- 6. VISUALIZATIONS ---
-def plot_trend_old_style(weekly_df, alarm_name, projected_val):
+def plot_trend_old_style(weekly_df, alarm_name):
+    # MATCHES LOCAL: No 3rd argument, draws raw data
     fig = go.Figure()
     if weekly_df.empty: return fig
     
-    plot_df = weekly_df.copy()
-    
-    # --- CRITICAL FIX: Overwrite the last data point with Projection ---
-    # This connects the trend line to the forecast instead of diving to 0/low
-    if len(plot_df) > 0:
-        plot_df.iloc[-1, plot_df.columns.get_loc('per_bc')] = projected_val
-
-    max_y = max(6, plot_df['per_bc'].max() * 1.1)
+    max_y = max(6, weekly_df['per_bc'].max() * 1.1)
     
     fig.add_hrect(y0=0, y1=3, line_width=0, fillcolor="rgba(46, 204, 113, 0.15)", layer="below")
     fig.add_hrect(y0=3, y1=5, line_width=0, fillcolor="rgba(241, 196, 15, 0.15)", layer="below")
     fig.add_hrect(y0=5, y1=max_y, line_width=0, fillcolor="rgba(231, 76, 60, 0.15)", layer="below")
     
     fig.add_trace(go.Scatter(
-        x=plot_df['label'], y=plot_df['per_bc'],
+        x=weekly_df['label'], y=weekly_df['per_bc'],
         mode="lines+markers+text", name=alarm_name,
         line=dict(color="#0072C6", width=3),
         marker=dict(size=8, color="#3498DB"),
-        text=plot_df['per_bc'].round(2), textposition="top center",
+        text=weekly_df['per_bc'].round(2), textposition="top center",
         textfont=dict(color="black", size=12)
     ))
     
@@ -381,8 +386,6 @@ def trigger_power_automate(html_body, prediction, recipients_str):
 def calculate_smart_forecast(df_filtered, weekly, current_week, total_hc):
     """
     UPGRADED ALGORITHM: Adaptive Bayesian Profile + Momentum Drift
-    1. Uses Exponential Decay (Recent weeks matter more for the profile).
-    2. Adds Momentum Factor (Detects if fleet performance is degrading).
     """
     # --- A. Context & Data Prep ---
     current_data = df_filtered[df_filtered['week'] == current_week]
@@ -553,8 +556,8 @@ def main():
         st.markdown('<div class="metric-card">', unsafe_allow_html=True)
         col_chart, col_text = st.columns([2, 1])
         with col_chart:
-            # Pass forecast to trend chart to fix the "nose-dive"
-            st.plotly_chart(plot_trend_old_style(weekly.tail(12), alarm, final_projected_val), use_container_width=True)
+            # MATCHING LOCAL: Passed raw weekly df only (removed the 3rd arg)
+            st.plotly_chart(plot_trend_old_style(weekly.tail(12), alarm), use_container_width=True)
         with col_text:
             st.markdown("### 📋 Executive Brief")
             if llm:
@@ -670,6 +673,7 @@ def main():
                         trend_txt = f"{abs(pct_diff):.1f}% {'higher' if diff > 0 else 'lower'} than 4-wk average"
                         
                         offender_list = wk_payload['top_15_toxic_combinations'][:5]
+                        # UPDATED STRING TO INCLUDE MODEL
                         offender_str = "\n".join([f"<tr><td>{i['depot_id']}</td><td>{i['svc_no']}</td><td>{i['bus_no']}</td><td>{i['model']}</td><td>{i['driver_id']}</td><td>{i['count']}</td></tr>" for i in offender_list])
                         
                         with st.spinner("Drafting email..."):
