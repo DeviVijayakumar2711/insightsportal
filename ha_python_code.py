@@ -40,11 +40,13 @@ st.set_page_config(page_title="Fleet Operations Center", page_icon="🚍", layou
 st.markdown("""
 <style>
     .stApp { background-color: #F4F6F9; }
+    
     .metric-card {
         background-color: white; padding: 25px; border-radius: 10px;
         border: 1px solid #E1E4E8; box-shadow: 0 2px 4px rgba(0,0,0,0.02);
         margin-bottom: 20px;
     }
+    
     .stTabs [data-baseweb="tab"] {
         height: 50px; background-color: white; border-radius: 6px;
         border: 1px solid #E5E7EB; padding: 0 25px; font-weight: 600;
@@ -52,12 +54,14 @@ st.markdown("""
     .stTabs [aria-selected="true"] {
         background-color: #EFF6FF; border-color: #3B82F6; color: #1D4ED8;
     }
+
     .alert-banner {
         padding: 20px; border-radius: 8px; font-weight: 600; margin-bottom: 15px;
     }
     .alert-critical { background-color: #FEF2F2; border-left: 5px solid #EF4444; color: #991B1B; }
     .alert-elevated { background-color: #FEF9E7; border-left: 5px solid #F1C40F; color: #7D6608; }
     .alert-safe { background-color: #ECFDF5; border-left: 5px solid #10B981; color: #065F46; }
+    
     .stChatInput { position: fixed; bottom: 20px; width: 70%; left: 15%; z-index: 999; }
 </style>
 """, unsafe_allow_html=True)
@@ -75,6 +79,7 @@ DATA CONTEXT:
 * **12-Week Trend:** {trend_vals}
 * **Latest Full Week Rate:** {last_full_val}
 * **Depot Breakdown:** {depot_stats}
+
 INSTRUCTIONS:
 1. **SEVERITY FIRST:**
    - If rate > 5.0, you MUST start with "CRITICAL STATUS".
@@ -87,7 +92,10 @@ INSTRUCTIONS:
 PROMPT_WEEKLY_INSIGHT = """
 You are an expert Bus Operations Analyst. Alarm type: {alarm_code}.
 Using ONLY this JSON summary for a SINGLE week, produce insights.
-DATA: {payload}
+
+DATA:
+{payload}
+
 Write markdown with EXACT sections:
 ### Executive Summary
 ### Actionable Anomaly Detection
@@ -100,9 +108,13 @@ Return a 3-row Markdown Table: | Priority | Recommended Action | Data-Driven Rat
 PROMPT_4WEEK_DEEP = """
 You are a world-class Bus Operations Analyst.
 Your task is to analyze the root cause of the 4-week trend for '{alarm_code}'.
+
 {context_str}
-DATA: {data_json}
-YOUR MISSION (Write in Markdown):
+
+**DATA:**
+{data_json}
+
+**YOUR MISSION (Write in Markdown):**
 1. **Overall Trend Diagnosis:** Summary of the 4-week fleet trend.
 2. **Key Spike Drivers:** Identify specific Drivers, Buses, or Services causing the trend.
 3. **Hidden Insights:** Find the nexus (Driver -> Bus -> Service).
@@ -116,11 +128,15 @@ SCENARIO:
 * **Projected Value:** {projection}
 * **Trend Context:** {trend_context}
 * **Top Offenders Data:** {offender_data}
+
 INSTRUCTIONS:
 Return **ONLY** the HTML code.
 Follow this exact structure:
 <h2 style="color: #b91c1c;">Operational Alert: {alarm} Metric Trending into RED ZONE</h2>
-<p><strong>Projected Value:</strong> {projection}<br><strong>Percentage Increase:</strong> {trend_context}</p>
+<p>
+  <strong>Projected Value:</strong> {projection}<br>
+  <strong>Percentage Increase:</strong> {trend_context}
+</p>
 <h3 style="color: #b91c1c;">Root Cause Analysis</h3>
 <p>[Write 2 sentences analyzing the 'Top Offenders Data']</p>
 <h3>Top Offenders</h3>
@@ -145,7 +161,9 @@ def initialize_llm():
         endpoint = get_config("AZURE_ENDPOINT")
         api_key = get_config("OPENAI_API_KEY")
         deployment = get_config("AZURE_DEPLOYMENT")
+        
         if not endpoint or not api_key: return None
+            
         return AzureChatOpenAI(
             azure_endpoint=endpoint.rstrip("/"),
             openai_api_key=api_key,
@@ -157,6 +175,7 @@ def initialize_llm():
         print(f"LLM Init Error: {e}")
         return None
 
+# --- 5. DATA LOGIC ---
 class NpEncoder(json.JSONEncoder):
     def default(self, obj):
         if isinstance(obj, np.integer): return int(obj)
@@ -164,17 +183,14 @@ class NpEncoder(json.JSONEncoder):
         if isinstance(obj, np.ndarray): return obj.tolist()
         return super(NpEncoder, self).default(obj)
 
-# --- 5. ROBUST DATA LOADING ---
 @st.cache_data
 def load_data():
-    """
-    Robust Loader with Diagnostics for Model Data
-    """
+    """Robust Data Loader with Diagnostics"""
     path_tele = get_config("TELEMATICS_URL", "telematics_new_data_2207.csv")
     path_head = get_config("HEADCOUNTS_URL", "depot_headcounts.csv")
     path_excl = get_config("EXCLUSIONS_URL", "vehicle_exclusions.csv")
     
-    # Absolute path fix for local files in Azure
+    # Robust Pathing
     base_dir = os.path.dirname(os.path.abspath(__file__))
     path_model_url = get_config("MODEL_URL", "").strip()
     path_model_local = os.path.join(base_dir, "model.csv")
@@ -185,7 +201,6 @@ def load_data():
         if not path_val: return pd.DataFrame()
         path_str = str(path_val).strip()
         
-        # A) URL Read
         if path_str.lower().startswith("http"):
             try:
                 return pd.read_csv(path_str)
@@ -193,7 +208,6 @@ def load_data():
                 if is_required: st.error(f"❌ Read Error ({path_str}): {e}")
                 return pd.DataFrame()
         
-        # B) Local File Read
         if not os.path.isabs(path_str): path_str = os.path.join(base_dir, path_str)
         if os.path.exists(path_str):
             return pd.read_csv(path_str)
@@ -201,7 +215,6 @@ def load_data():
             if is_required: st.error(f"❌ File Not Found: {path_str}")
             return pd.DataFrame()
 
-    # Load Main Data
     df = smart_read(path_tele, is_required=True)
     headcounts = smart_read(path_head)
     exclusions = smart_read(path_excl)
@@ -215,33 +228,21 @@ def load_data():
             df[c] = df[c].astype(str).str.strip().str.upper()
             df[c] = df[c].replace(['NAN', 'NULL', 'NONE', ''], None)
 
-    # --- DIAGNOSTIC MODEL LOADING ---
+    # --- MODEL LOADING ---
     bus_models = pd.DataFrame()
-    
-    # 1. Try URL
     if path_model_url:
-        try:
-            bus_models = pd.read_csv(path_model_url)
-            diagnostics['model_status'] = "Loaded from URL"
-        except Exception as e:
-            diagnostics['model_status'] = f"URL Failed: {str(e)}"
+        try: bus_models = pd.read_csv(path_model_url); diagnostics['model_status'] = "Loaded from URL"
+        except Exception as e: diagnostics['model_status'] = f"URL Failed: {str(e)}"
     
-    # 2. Try Local if URL failed
     if bus_models.empty and os.path.exists(path_model_local):
-        try:
-            bus_models = pd.read_csv(path_model_local)
-            diagnostics['model_status'] = "Loaded from Local File"
-        except Exception as e:
-            diagnostics['model_status'] = f"Local Read Failed: {str(e)}"
+        try: bus_models = pd.read_csv(path_model_local); diagnostics['model_status'] = "Loaded from Local File"
+        except Exception as e: diagnostics['model_status'] = f"Local Read Failed: {str(e)}"
     
-    # 3. Merge Logic with Column Standardization
     if not bus_models.empty:
-        # Standardize columns to handle 'Bus No', 'Bus Number', 'vehicle_id', etc.
         bus_models.columns = [c.lower().strip().replace(' ', '_').replace('.', '') for c in bus_models.columns]
         diagnostics['model_cols'] = list(bus_models.columns)
         
-        # Find the ID column
-        possible_ids = ['bus_no', 'bus_number', 'vehicle_no', 'vehicle_id', 'reg_no', 'registration_number']
+        possible_ids = ['bus_no', 'bus_number', 'vehicle_no', 'vehicle_id']
         found_id = next((c for c in bus_models.columns if c in possible_ids), None)
         
         if found_id:
@@ -249,31 +250,18 @@ def load_data():
             bus_models['bus_no'] = bus_models['bus_no'].astype(str).str.strip().str.upper()
             
             if 'model' in bus_models.columns:
-                # Actual Merge
-                before_len = len(df)
                 df = df.merge(bus_models[['bus_no', 'model']], on='bus_no', how='left')
                 df['model'] = df['model'].fillna('Unknown')
-                
-                # Check success rate
-                matched = df[df['model'] != 'Unknown'].shape[0]
-                diagnostics['merge_count'] = matched
-                if matched > 0:
-                    diagnostics['model_status'] += " & Merged Successfully"
-                else:
-                    diagnostics['model_status'] += " (Merged but 0 matches found)"
+                diagnostics['merge_count'] = df[df['model'] != 'Unknown'].shape[0]
+                diagnostics['model_status'] += " & Merged Successfully"
             else:
                 diagnostics['model_status'] += " (Missing 'model' column)"
         else:
-            diagnostics['model_status'] += f" (ID column not found. Cols: {list(bus_models.columns)})"
+            diagnostics['model_status'] += " (No ID column found)"
             
-    else:
-        if diagnostics['model_status'] == "Not Attempted":
-            diagnostics['model_status'] = "No URL or Local File found"
-
-    # Fallback
     if 'model' not in df.columns: df['model'] = 'Unknown'
 
-    # Process Headcounts & Exclusions
+    # Headcounts & Exclusions
     if 'depot_id' in headcounts.columns:
         headcounts['depot_id'] = headcounts['depot_id'].astype(str).str.strip().str.upper()
     else:
@@ -328,11 +316,11 @@ def process_metrics(df, headcounts, alarm_type, depots, exclude_null_driver, onl
     
     return df_filtered, weekly, weekly_payload, wk_4_payload, latest_wk
 
-# --- 6. VISUALIZATIONS & LOGIC ---
+# --- 6. VISUALIZATIONS ---
 def plot_trend_old_style(weekly_df, alarm_name):
     fig = go.Figure()
     if weekly_df.empty: return fig
-    plot_df = weekly_df.copy() # Use actuals
+    plot_df = weekly_df.copy()
     max_y = max(6, plot_df['per_bc'].max() * 1.1)
     
     fig.add_hrect(y0=0, y1=3, line_width=0, fillcolor="rgba(46, 204, 113, 0.15)", layer="below")
@@ -353,6 +341,22 @@ def plot_trend_old_style(weekly_df, alarm_name):
     
     fig.update_layout(title=f"12-Week Trend ({alarm_name})", yaxis_title="Avg per Bus Captain", yaxis_range=[0, max_y], showlegend=False, margin=dict(l=20, r=20, t=40, b=20), height=350)
     return fig
+
+def plot_single_forecast_bar(comp_df):
+    fig = go.Figure()
+    colors = ['#BDC3C7' if r['status'] == 'Completed' else ('#E74C3C' if r['display_rate']>5 else '#2ECC71') for _, r in comp_df.iterrows()]
+    fig.add_trace(go.Bar(x=comp_df['week_label'], y=comp_df['display_rate'], marker_color=colors, text=comp_df['display_rate'].round(2), textposition='auto'))
+    fig.add_hline(y=5.0, line_dash="dash", line_color="red")
+    fig.update_layout(title="Risk Timeline", margin=dict(l=20, r=20, t=40, b=20), height=350)
+    return fig
+
+def trigger_power_automate(html_body, prediction, recipients_str):
+    try:
+        url = get_config("POWER_AUTOMATE_FLOW_URL")
+        if not url: return False
+        requests.post(url, json={"subject": f"⚠️ ALERT: Rate {prediction:.2f}", "body": html_body, "recipient": recipients_str}, timeout=6)
+        return True
+    except: return False
 
 def calculate_smart_forecast(df_filtered, weekly, current_week, total_hc):
     latest_row = weekly.iloc[-1]
@@ -412,22 +416,6 @@ def calculate_smart_forecast(df_filtered, weekly, current_week, total_hc):
             
     return comparison_rows[-1]['display_rate'], pd.DataFrame(comparison_rows), {"day": day_name, "completion_rate": completion_rate, "weight_profile": w_prof, "weight_avg": w_avg}
 
-def plot_single_forecast_bar(comp_df):
-    fig = go.Figure()
-    colors = ['#BDC3C7' if r['status'] == 'Completed' else ('#E74C3C' if r['display_rate']>5 else '#2ECC71') for _, r in comp_df.iterrows()]
-    fig.add_trace(go.Bar(x=comp_df['week_label'], y=comp_df['display_rate'], marker_color=colors, text=comp_df['display_rate'].round(2), textposition='auto'))
-    fig.add_hline(y=5.0, line_dash="dash", line_color="red")
-    fig.update_layout(title="Risk Timeline", margin=dict(l=20, r=20, t=40, b=20), height=350)
-    return fig
-
-def trigger_power_automate(html_body, prediction, recipients_str):
-    try:
-        url = get_config("POWER_AUTOMATE_FLOW_URL")
-        if not url: return False
-        requests.post(url, json={"subject": f"⚠️ ALERT: Rate {prediction:.2f}", "body": html_body, "recipient": recipients_str}, timeout=6)
-        return True
-    except: return False
-
 # --- 7. MAIN APP ---
 def main():
     llm = initialize_llm()
@@ -435,7 +423,7 @@ def main():
     with st.sidebar:
         st.markdown("### 🎛️ Control Panel")
         
-        # CACHE RESET BUTTON
+        # CACHE RESET
         if st.button("🔄 Reset Cache & Reload Data"):
             st.cache_data.clear()
             st.rerun()
@@ -443,14 +431,12 @@ def main():
         alarm = st.selectbox("Alarm Type", list(ALARM_MAP.keys()))
         df, headcounts, diagnostics = load_data()
         
-        # DIAGNOSTICS DISPLAY
-        with st.expander("🛠️ Diagnostics (Fix Unknown Models)"):
-            st.write(f"**Model Loading Status:** {diagnostics.get('model_status')}")
-            st.write(f"**Columns Found:** {diagnostics.get('model_cols')}")
-            st.write(f"**Successful Merges:** {diagnostics.get('merge_count')} records")
+        with st.expander("🛠️ Diagnostics (Model Data)"):
+            st.write(f"Status: {diagnostics.get('model_status')}")
+            st.write(f"Matched: {diagnostics.get('merge_count')} records")
             
         if df.empty:
-            st.warning("⚠️ Data missing. Check TELEMATICS_URL.")
+            st.warning("⚠️ Data missing.")
             st.stop()
             
         depot_opts = sorted(headcounts['depot_id'].unique())
@@ -485,7 +471,7 @@ def main():
             st.write(st.session_state.exec_brief)
         else: st.info("AI Not Connected")
 
-    t1, t2, t3 = st.tabs(["📊 Weekly Deep Dive", "🧠 4-Week Pattern", "🔮 Risk Forecast"])
+    t1, t2, t3 = st.tabs(["📊 Weekly Deep Dive", "🧠 4-Week Pattern", "🔮 Risk Forecast & Alert"])
     
     with t1:
         c1, c2 = st.columns([1, 2])
@@ -502,33 +488,88 @@ def main():
             if llm and st.button("Run Systemic Scan"):
                 with st.spinner("Scanning..."): st.markdown(llm.predict(PROMPT_4WEEK_DEEP.format(alarm_code=alarm, context_str=f"Rate: {weekly.iloc[-1]['per_bc']}", data_json=json.dumps(wk4_payload, cls=NpEncoder))))
 
+    # --- TAB 3: UI MATCHED TO LOCAL (Send Button & Preview) ---
     with t3:
-        c1, c2 = st.columns(2)
-        c1.plotly_chart(plot_single_forecast_bar(comp_df), use_container_width=True)
-        with c2:
-            st.markdown(f"#### Risk Status: {final_projected_val:.2f}")
+        st.markdown('<div class="metric-card">', unsafe_allow_html=True)
+        
+        # 1. FORECAST BAR
+        st.plotly_chart(plot_single_forecast_bar(comp_df), use_container_width=True)
+        st.dataframe(comp_df, use_container_width=True)
+        
+        st.markdown("---")
+        
+        # 2. ESCALATION PROTOCOL (Matched UI)
+        st.subheader("📢 Escalation Protocol")
+        c_email_btn, c_email_prev = st.columns([1, 2])
+        
+        with c_email_btn:
             if final_projected_val > 5.0:
-                st.error("🚨 CRITICAL RISK (>5.0)")
-                if llm:
-                    recipients = st.text_input("Recipients", "devi02@smrt.com.sg")
-                    if st.button("📝 Draft Alert"):
-                        offender_str = "\n".join([f"<tr><td>{i['depot_id']}</td><td>{i['svc_no']}</td><td>{i['bus_no']}</td><td>{i['model']}</td><td>{i['driver_id']}</td><td>{i['count']}</td></tr>" for i in wk_payload['top_15_toxic_combinations'][:5]])
-                        st.session_state.email_html_draft = llm.predict(PROMPT_ALERT_EMAIL.format(alarm=alarm, projection=f"{final_projected_val:.2f}", trend_context="High", offender_data=offender_str))
-                    
-                    if "email_html_draft" in st.session_state:
-                        st.components.v1.html(st.session_state.email_html_draft, height=300, scrolling=True)
-                        if st.button("📨 Send Alert"):
-                            if trigger_power_automate(st.session_state.email_html_draft, final_projected_val, recipients): st.success("Sent!")
-                            else: st.error("Failed")
-            elif final_projected_val > 3.0: st.warning("⚠️ ELEVATED RISK")
-            else: st.success("✅ SAFE")
+                st.info("Risk Level Critical: Alert Generation Enabled.")
+                recipients = st.text_input("Recipients", "devi02@smrt.com.sg; fleet_ops@smrt.com.sg")
+                
+                if st.button("📝 Draft Alert Email"):
+                     if llm:
+                        avg_4 = weekly.tail(4)['per_bc'].mean()
+                        diff = final_projected_val - avg_4
+                        pct_diff = (diff / avg_4) * 100 if avg_4 > 0 else 0
+                        trend_txt = f"{abs(pct_diff):.1f}% {'higher' if diff > 0 else 'lower'} than 4-wk average"
+                        
+                        offender_list = wk_payload['top_15_toxic_combinations'][:5]
+                        offender_str = "\n".join([f"<tr><td>{i['depot_id']}</td><td>{i['svc_no']}</td><td>{i['bus_no']}</td><td>{i['model']}</td><td>{i['driver_id']}</td><td>{i['count']}</td></tr>" for i in offender_list])
+                        
+                        with st.spinner("Drafting email..."):
+                            st.session_state.email_html_draft = llm.predict(PROMPT_ALERT_EMAIL.format(
+                                alarm=alarm, projection=f"{final_projected_val:.2f}", 
+                                trend_context=trend_txt, offender_data=offender_str
+                            ))
+                     else:
+                          st.error("AI not connected")
 
-    with st.expander("🧠 Forecast Logic"):
-        st.markdown(f"Day: **{explainer['day']}**. Completion: **{explainer['completion_rate']*100:.0f}%**. We trust Trend **{explainer['weight_profile']*100:.0f}%** and History **{explainer['weight_avg']*100:.0f}%**.")
+                if "email_html_draft" in st.session_state:
+                    if st.button("📨 Send via Power Automate"):
+                        if trigger_power_automate(st.session_state.email_html_draft, final_projected_val, recipients):
+                            st.success("Alert Sent Successfully")
+                        else:
+                            st.error("Transmission Failed")
+            else:
+                st.success("Current Risk is below Critical Threshold (5.0). Escalation Protocol is inactive.")
 
-    st.divider()
-    if user_input := st.chat_input("Ask Root Cause Analyst..."):
-        if llm: st.markdown(llm.predict(f"Analyst. Question: {user_input}. Context: {json.dumps(wk_payload, cls=NpEncoder)}"))
+        with c_email_prev:
+            if "email_html_draft" in st.session_state and final_projected_val > 5.0:
+                st.markdown("**Email Preview:**")
+                st.components.v1.html(st.session_state.email_html_draft, height=300, scrolling=True)
+
+        st.markdown('</div>', unsafe_allow_html=True)
+
+        with st.expander("🧠 Forecast Logic"):
+            st.markdown(f"Day: **{explainer['day']}**. Completion: **{explainer['completion_rate']*100:.0f}%**.")
+
+    # --- CHAT UI MATCHED TO LOCAL (Bot Bubbles) ---
+    st.markdown("---")
+    st.subheader("💬 Root Cause Analyst")
+    
+    # Initialize chat history
+    if "chat_log" not in st.session_state:
+        st.session_state.chat_log = [{"role": "assistant", "content": "I have access to the full dataset. Ask me 'Why did W44 spike?'"}]
+    
+    # Display Chat Bubbles
+    for msg in st.session_state.chat_log:
+        with st.chat_message(msg["role"]): st.markdown(msg["content"])
+        
+    # Input Logic
+    if user_val := st.chat_input("Ask a complex question...", key="chat_widget"):
+        st.session_state.chat_log.append({"role": "user", "content": user_val})
+        with st.chat_message("user"): st.markdown(user_val)
+        with st.chat_message("assistant"):
+            if llm:
+                with st.spinner("Analyzing full dataset..."):
+                    raw_context = json.dumps(wk_payload, indent=2, cls=NpEncoder)
+                    chat_prompt = f"Senior Data Scientist. Question: {user_val}. Context: {raw_context}"
+                    response = llm.predict(chat_prompt)
+                    st.markdown(response)
+                    st.session_state.chat_log.append({"role": "assistant", "content": response})
+            else:
+                st.write("AI Not Connected.")
 
 if __name__ == "__main__":
     main()
