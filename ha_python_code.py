@@ -19,9 +19,6 @@ load_dotenv()
 
 # --- 1. CONFIGURATION HELPER ---
 def get_config(key, default=""):
-    """
-    Retrieves configuration from Azure Environment Variables first.
-    """
     if key in os.environ:
         return os.environ[key]
     
@@ -66,7 +63,7 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# --- 3. CONSTANTS & PROMPTS ---
+# --- 3. CONSTANTS & PROMPTS (UPDATED FOR TONE) ---
 ALARM_MAP = {
     "HA": {"long": "Harsh Acceleration", "short": "HA"},
     "HB": {"long": "Harsh Braking",      "short": "HB"},
@@ -81,12 +78,12 @@ DATA CONTEXT:
 * **Depot Breakdown:** {depot_stats}
 
 INSTRUCTIONS:
-1. **SEVERITY FIRST:**
-   - If rate > 5.0, you MUST start with "CRITICAL STATUS".
-   - If rate > 3.0, start with "ELEVATED STATUS".
-2. **Trend Context:** Only after establishing the critical nature, mention the trend.
-3. **Primary Contributor:** Identify which Depot is driving the numbers.
-4. **Tone:** Urgent, professional, and direct.
+1. **Status Update:**
+   - If rate > 5.0, state "CRITICAL ATTENTION REQUIRED".
+   - If rate > 3.0, state "ELEVATED STATUS".
+2. **Context:** Mention if the trend is improving or requiring monitoring.
+3. **Focus Area:** Identify which Depot is the primary contributor.
+4. **Tone:** Professional, constructive, and direct. Avoid alarmist language.
 """
 
 PROMPT_WEEKLY_INSIGHT = """
@@ -98,11 +95,12 @@ DATA:
 
 Write markdown with EXACT sections:
 ### Executive Summary
-### Actionable Anomaly Detection
-- **Nexus of Risk:** Identify cross-category patterns.
-- **Category-Specific Insights:** Compare performance vs fleet average.
-### Prioritized Recommendations
+### Operational Patterns
+- **Key Concentrations:** Identify cross-category patterns (e.g. Driver X on Bus Y).
+- **Performance Context:** Compare current performance vs fleet average.
+### Recommended Actions
 Return a 3-row Markdown Table: | Priority | Recommended Action | Data-Driven Rationale |
+(Use phrases like "Monitor depot", "Review settings", or "Engage driver" instead of "Audit" or "Investigate").
 """
 
 PROMPT_4WEEK_DEEP = """
@@ -115,10 +113,10 @@ Your task is to analyze the root cause of the 4-week trend for '{alarm_code}'.
 {data_json}
 
 **YOUR MISSION (Write in Markdown):**
-1. **Overall Trend Diagnosis:** Summary of the 4-week fleet trend.
-2. **Key Spike Drivers:** Identify specific Drivers, Buses, or Services causing the trend.
-3. **Hidden Insights:** Find the nexus (Driver -> Bus -> Service).
-4. **Actionable Summary:** Brief, prioritized summary.
+1. **Trend Overview:** Summary of the 4-week fleet performance.
+2. **Contributing Factors:** Identify specific Drivers, Buses, or Services influencing the trend.
+3. **Operational Nexus:** Find connections (Driver -> Bus -> Service).
+4. **Summary:** Brief, prioritized next steps.
 """
 
 PROMPT_ALERT_EMAIL = """
@@ -127,28 +125,28 @@ SCENARIO:
 * **Metric:** {alarm}
 * **Projected Value:** {projection}
 * **Trend Context:** {trend_context}
-* **Top Offenders Data:** {offender_data}
+* **Top Contributors Data:** {offender_data}
 
 INSTRUCTIONS:
 Return **ONLY** the HTML code.
 Follow this exact structure:
-<h2 style="color: #b91c1c;">Operational Alert: {alarm} Metric Trending into RED ZONE</h2>
+<h2 style="color: #b91c1c;">Operational Update: {alarm} Metric Status</h2>
 <p>
   <strong>Projected Value:</strong> {projection}<br>
-  <strong>Percentage Increase:</strong> {trend_context}
+  <strong>Context:</strong> {trend_context}
 </p>
-<h3 style="color: #b91c1c;">Root Cause Analysis</h3>
-<p>[Write 2 sentences analyzing the 'Top Offenders Data']</p>
-<h3>Top Offenders</h3>
+<h3 style="color: #b91c1c;">Analysis</h3>
+<p>[Write 2 sentences analyzing the 'Top Contributors Data'. Use neutral language.]</p>
+<h3>Top Contributors</h3>
 <table border="1" cellpadding="5" cellspacing="0" style="border-collapse: collapse; width: 100%;">
   <tr style="background-color: #f2f2f2;"><th>Depot</th><th>Service</th><th>Bus</th><th>Model</th><th>Driver</th><th>Count</th></tr>
   [Generate rows from offender_data]
 </table>
-<h3 style="color: #b91c1c;">Action Required</h3>
+<h3 style="color: #b91c1c;">Suggested Actions</h3>
 <ul>
-  <li>Investigate root cause of high alarm frequency on top offending Services.</li>
-  <li>Engage with the relevant Depot to address driver-specific alarm patterns.</li>
-  <li>Monitor {alarm} metric closely.</li>
+  <li>Review root cause of alarm frequency on top services.</li>
+  <li>Engage with the relevant Depot to discuss driver support.</li>
+  <li>Continue monitoring {alarm} metric.</li>
 </ul>
 <p>Best regards,<br>Data Analytics Team</p>
 """
@@ -227,6 +225,11 @@ def load_data():
         if c in df.columns: 
             df[c] = df[c].astype(str).str.strip().str.upper()
             df[c] = df[c].replace(['NAN', 'NULL', 'NONE', ''], None)
+            
+            # --- FIX: Remove Decimals from Driver ID ---
+            if c == 'driver_id':
+                # Convert to string, then remove .0 ending using regex
+                df[c] = df[c].astype(str).str.replace(r'\.0$', '', regex=True)
 
     # --- MODEL LOADING ---
     bus_models = pd.DataFrame()
@@ -303,8 +306,10 @@ def process_metrics(df, headcounts, alarm_type, depots, exclude_null_driver, onl
     weekly_payload = {
         "week_number": int(latest_wk),
         "total_alarms": int(len(df_curr)),
+        "total_headcount": int(total_hc),  # Needed for AI math
         "depot_breakdown": df_curr['depot_id'].value_counts().to_dict(),
-        "top_15_toxic_combinations": df_curr.groupby(['depot_id', 'svc_no', 'bus_no', 'model', 'driver_id']).size().sort_values(ascending=False).head(15).reset_index(name='count').to_dict(orient='records')
+        "model_breakdown": df_curr['model'].value_counts().to_dict(), # ADDED FOR AI MATH
+        "top_contributors": df_curr.groupby(['depot_id', 'svc_no', 'bus_no', 'model', 'driver_id']).size().sort_values(ascending=False).head(15).reset_index(name='count').to_dict(orient='records')
     }
     
     df_4wk = df_filtered[df_filtered['week'] >= (latest_wk - 3)]
@@ -488,17 +493,12 @@ def main():
             if llm and st.button("Run Systemic Scan"):
                 with st.spinner("Scanning..."): st.markdown(llm.predict(PROMPT_4WEEK_DEEP.format(alarm_code=alarm, context_str=f"Rate: {weekly.iloc[-1]['per_bc']}", data_json=json.dumps(wk4_payload, cls=NpEncoder))))
 
-    # --- TAB 3: UI MATCHED TO LOCAL (Send Button & Preview) ---
     with t3:
         st.markdown('<div class="metric-card">', unsafe_allow_html=True)
-        
-        # 1. FORECAST BAR
         st.plotly_chart(plot_single_forecast_bar(comp_df), use_container_width=True)
         st.dataframe(comp_df, use_container_width=True)
-        
         st.markdown("---")
         
-        # 2. ESCALATION PROTOCOL (Matched UI)
         st.subheader("📢 Escalation Protocol")
         c_email_btn, c_email_prev = st.columns([1, 2])
         
@@ -514,7 +514,7 @@ def main():
                         pct_diff = (diff / avg_4) * 100 if avg_4 > 0 else 0
                         trend_txt = f"{abs(pct_diff):.1f}% {'higher' if diff > 0 else 'lower'} than 4-wk average"
                         
-                        offender_list = wk_payload['top_15_toxic_combinations'][:5]
+                        offender_list = wk_payload['top_contributors'][:5]
                         offender_str = "\n".join([f"<tr><td>{i['depot_id']}</td><td>{i['svc_no']}</td><td>{i['bus_no']}</td><td>{i['model']}</td><td>{i['driver_id']}</td><td>{i['count']}</td></tr>" for i in offender_list])
                         
                         with st.spinner("Drafting email..."):
@@ -522,17 +522,14 @@ def main():
                                 alarm=alarm, projection=f"{final_projected_val:.2f}", 
                                 trend_context=trend_txt, offender_data=offender_str
                             ))
-                     else:
-                          st.error("AI not connected")
+                     else: st.error("AI not connected")
 
                 if "email_html_draft" in st.session_state:
                     if st.button("📨 Send via Power Automate"):
                         if trigger_power_automate(st.session_state.email_html_draft, final_projected_val, recipients):
                             st.success("Alert Sent Successfully")
-                        else:
-                            st.error("Transmission Failed")
-            else:
-                st.success("Current Risk is below Critical Threshold (5.0). Escalation Protocol is inactive.")
+                        else: st.error("Transmission Failed")
+            else: st.success("Current Risk is below Critical Threshold (5.0). Escalation Protocol is inactive.")
 
         with c_email_prev:
             if "email_html_draft" in st.session_state and final_projected_val > 5.0:
@@ -540,32 +537,37 @@ def main():
                 st.components.v1.html(st.session_state.email_html_draft, height=300, scrolling=True)
 
         st.markdown('</div>', unsafe_allow_html=True)
-
         with st.expander("🧠 Forecast Logic"):
             st.markdown(f"Day: **{explainer['day']}**. Completion: **{explainer['completion_rate']*100:.0f}%**.")
 
-    # --- CHAT UI MATCHED TO LOCAL (Bot Bubbles) ---
     st.markdown("---")
     st.subheader("💬 Root Cause Analyst")
     
-    # Initialize chat history
     if "chat_log" not in st.session_state:
-        st.session_state.chat_log = [{"role": "assistant", "content": "I have access to the full dataset. Ask me 'Why did W44 spike?'"}]
+        st.session_state.chat_log = [{"role": "assistant", "content": "I have access to the full dataset. Ask me 'What if we remove BYD model?'"}]
     
-    # Display Chat Bubbles
     for msg in st.session_state.chat_log:
         with st.chat_message(msg["role"]): st.markdown(msg["content"])
         
-    # Input Logic
     if user_val := st.chat_input("Ask a complex question...", key="chat_widget"):
         st.session_state.chat_log.append({"role": "user", "content": user_val})
         with st.chat_message("user"): st.markdown(user_val)
         with st.chat_message("assistant"):
             if llm:
                 with st.spinner("Analyzing full dataset..."):
-                    raw_context = json.dumps(wk_payload, indent=2, cls=NpEncoder)
-                    chat_prompt = f"Senior Data Scientist. Question: {user_val}. Context: {raw_context}"
-                    response = llm.predict(chat_prompt)
+                    # SYSTEM PROMPT FOR CHATBOT MATH
+                    system_instructions = f"""
+                    You are a data analyst. 
+                    Context Data: {json.dumps(wk_payload, cls=NpEncoder)}
+                    
+                    **Logic for 'What-if' Questions:**
+                    1. If user asks "What if we remove [MODEL]?", look at 'model_breakdown'.
+                    2. Subtract that model's alarms from 'total_alarms'.
+                    3. Recalculate rate = (New Total / total_headcount).
+                    4. Show the math clearly: "Original Rate: X -> New Rate: Y".
+                    """
+                    
+                    response = llm.predict(f"{system_instructions}\nUser Question: {user_val}")
                     st.markdown(response)
                     st.session_state.chat_log.append({"role": "assistant", "content": response})
             else:
