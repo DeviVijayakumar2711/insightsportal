@@ -63,7 +63,7 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# --- 3. CONSTANTS & PROMPTS (UPDATED FOR TONE) ---
+# --- 3. CONSTANTS & PROMPTS ---
 ALARM_MAP = {
     "HA": {"long": "Harsh Acceleration", "short": "HA"},
     "HB": {"long": "Harsh Braking",      "short": "HB"},
@@ -96,7 +96,7 @@ DATA:
 Write markdown with EXACT sections:
 ### Executive Summary
 ### Operational Patterns
-- **Key Concentrations:** Identify cross-category patterns (e.g. Driver X on Bus Y).
+- **Key Concentrations:** Identify cross-category patterns.
 - **Performance Context:** Compare current performance vs fleet average.
 ### Recommended Actions
 Return a 3-row Markdown Table: | Priority | Recommended Action | Data-Driven Rationale |
@@ -228,7 +228,6 @@ def load_data():
             
             # --- FIX: Remove Decimals from Driver ID ---
             if c == 'driver_id':
-                # Convert to string, then remove .0 ending using regex
                 df[c] = df[c].astype(str).str.replace(r'\.0$', '', regex=True)
 
     # --- MODEL LOADING ---
@@ -306,9 +305,9 @@ def process_metrics(df, headcounts, alarm_type, depots, exclude_null_driver, onl
     weekly_payload = {
         "week_number": int(latest_wk),
         "total_alarms": int(len(df_curr)),
-        "total_headcount": int(total_hc),  # Needed for AI math
+        "total_headcount": int(total_hc),
         "depot_breakdown": df_curr['depot_id'].value_counts().to_dict(),
-        "model_breakdown": df_curr['model'].value_counts().to_dict(), # ADDED FOR AI MATH
+        "model_breakdown": df_curr['model'].value_counts().to_dict(),
         "top_contributors": df_curr.groupby(['depot_id', 'svc_no', 'bus_no', 'model', 'driver_id']).size().sort_values(ascending=False).head(15).reset_index(name='count').to_dict(orient='records')
     }
     
@@ -427,8 +426,6 @@ def main():
     
     with st.sidebar:
         st.markdown("### 🎛️ Control Panel")
-        
-        # CACHE RESET
         if st.button("🔄 Reset Cache & Reload Data"):
             st.cache_data.clear()
             st.rerun()
@@ -555,16 +552,26 @@ def main():
         with st.chat_message("assistant"):
             if llm:
                 with st.spinner("Analyzing full dataset..."):
-                    # SYSTEM PROMPT FOR CHATBOT MATH
-                    system_instructions = f"""
-                    You are a data analyst. 
-                    Context Data: {json.dumps(wk_payload, cls=NpEncoder)}
+                    # EXPANDED CONTEXT FOR AI (HISTORY + CURRENT)
+                    full_chat_context = {
+                        "trend_history": weekly[['year', 'week', 'count', 'per_bc']].to_dict(orient='records'),
+                        "current_week_deep_dive": wk_payload,
+                        "4_week_summary": wk4_payload
+                    }
                     
-                    **Logic for 'What-if' Questions:**
-                    1. If user asks "What if we remove [MODEL]?", look at 'model_breakdown'.
+                    system_instructions = f"""
+                    You are a data analyst using the full context provided (History + Current).
+                    Context: {json.dumps(full_chat_context, cls=NpEncoder)}
+                    
+                    **Handling 'What-If' Questions:**
+                    1. If user asks "What if we remove [MODEL]?", check 'current_week_deep_dive' -> 'model_breakdown'.
                     2. Subtract that model's alarms from 'total_alarms'.
                     3. Recalculate rate = (New Total / total_headcount).
-                    4. Show the math clearly: "Original Rate: X -> New Rate: Y".
+                    4. Show the math clearly.
+                    
+                    **Handling History Questions:**
+                    1. Use 'trend_history' for past weeks.
+                    2. Sum up counts/rates as requested.
                     """
                     
                     response = llm.predict(f"{system_instructions}\nUser Question: {user_val}")
