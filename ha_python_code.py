@@ -17,7 +17,7 @@ except ImportError:
 # Load local .env file (for local development only)
 load_dotenv()
 
-# --- 1. CONFIGURATION HELPER (Azure + Local) ---
+# --- 1. CONFIGURATION HELPER ---
 def get_config(key, default=""):
     """
     Retrieves configuration from Azure Environment Variables first.
@@ -87,7 +87,7 @@ INSTRUCTIONS:
 1. **SEVERITY FIRST:**
    - If rate > 5.0, you MUST start with "CRITICAL STATUS".
    - If rate > 3.0, start with "ELEVATED STATUS".
-2. **Trend Context:** Only after establishing the critical nature, mention the trend. (e.g., "Although trending down, the rate of {last_full_val} remains critically high...").
+2. **Trend Context:** Only after establishing the critical nature, mention the trend.
 3. **Primary Contributor:** Identify which Depot is driving the numbers.
 4. **Tone:** Urgent, professional, and direct.
 """
@@ -194,6 +194,7 @@ def load_data():
     path_tele = get_config("TELEMATICS_URL", "telematics_new_data_2207.csv")
     path_head = get_config("HEADCOUNTS_URL", "depot_headcounts.csv")
     path_excl = get_config("EXCLUSIONS_URL", "vehicle_exclusions.csv")
+    path_model = get_config("MODEL_URL", "model.csv") # New: Support Cloud URL for Model
 
     def smart_read(path_val, is_required=False):
         if not path_val: return pd.DataFrame()
@@ -222,35 +223,40 @@ def load_data():
     df = smart_read(path_tele, is_required=True)
     headcounts = smart_read(path_head)
     exclusions = smart_read(path_excl)
+    bus_models = smart_read(path_model) # Load models smartly
 
     if df.empty: return pd.DataFrame(), pd.DataFrame()
 
-    # Pre-process
+    # Pre-process Telematics
     df.columns = [c.lower().strip() for c in df.columns]
     for c in ['bus_no', 'driver_id', 'alarm_type', 'depot_id', 'svc_no']:
         if c in df.columns: 
             df[c] = df[c].astype(str).str.strip().str.upper()
             df[c] = df[c].replace(['NAN', 'NULL', 'NONE', ''], None)
     
-    # --- MODEL LOADING LOGIC (MATCHING LOCAL CODE) ---
-    try:
-        # NOTE: model.csv must be in the deployment zip for this to work
-        bus_models = pd.read_csv("model.csv")
-        
-        # Clean columns
-        bus_models.columns = [c.lower().strip() for c in bus_models.columns]
-        if 'bus_number' in bus_models.columns:
-            bus_models.rename(columns={'bus_number': 'bus_no'}, inplace=True)
-        
-        # Merge logic
-        if 'bus_no' in bus_models.columns:
-            bus_models['bus_no'] = bus_models['bus_no'].astype(str).str.strip().str.upper()
-            if 'model' in bus_models.columns:
-                df = df.merge(bus_models[['bus_no', 'model']], on='bus_no', how='left')
-                df['model'] = df['model'].fillna('Unknown')
-    except Exception:
-        # Fallback if model.csv is missing
-        if 'model' not in df.columns: df['model'] = 'Unknown'
+    # --- MODEL MERGING LOGIC ---
+    model_loaded = False
+    if not bus_models.empty:
+        try:
+            bus_models.columns = [c.lower().strip() for c in bus_models.columns]
+            if 'bus_number' in bus_models.columns:
+                bus_models.rename(columns={'bus_number': 'bus_no'}, inplace=True)
+            
+            if 'bus_no' in bus_models.columns:
+                bus_models['bus_no'] = bus_models['bus_no'].astype(str).str.strip().str.upper()
+                if 'model' in bus_models.columns:
+                    df = df.merge(bus_models[['bus_no', 'model']], on='bus_no', how='left')
+                    df['model'] = df['model'].fillna('Unknown')
+                    model_loaded = True
+        except Exception:
+            pass
+            
+    # Final fallback
+    if 'model' not in df.columns: 
+        df['model'] = 'Unknown'
+        if not model_loaded:
+            # We silently signal main() to warn user, or store in session state
+            st.session_state['model_warning'] = True
 
     if 'depot_id' in headcounts.columns:
         headcounts['depot_id'] = headcounts['depot_id'].astype(str).str.strip().str.upper()
@@ -310,22 +316,25 @@ def process_metrics(df, headcounts, alarm_type, depots, exclude_null_driver, onl
 
 # --- 6. VISUALIZATIONS ---
 def plot_trend_old_style(weekly_df, alarm_name):
-    # MATCHES LOCAL: No 3rd argument, draws raw data
     fig = go.Figure()
     if weekly_df.empty: return fig
     
-    max_y = max(6, weekly_df['per_bc'].max() * 1.1)
+    # --- FIXED: Use raw data, do not overwrite last point with projection ---
+    # This ensures the Azure graph looks exactly like the Local graph
+    plot_df = weekly_df.copy()
+    
+    max_y = max(6, plot_df['per_bc'].max() * 1.1)
     
     fig.add_hrect(y0=0, y1=3, line_width=0, fillcolor="rgba(46, 204, 113, 0.15)", layer="below")
     fig.add_hrect(y0=3, y1=5, line_width=0, fillcolor="rgba(241, 196, 15, 0.15)", layer="below")
     fig.add_hrect(y0=5, y1=max_y, line_width=0, fillcolor="rgba(231, 76, 60, 0.15)", layer="below")
     
     fig.add_trace(go.Scatter(
-        x=weekly_df['label'], y=weekly_df['per_bc'],
+        x=plot_df['label'], y=plot_df['per_bc'],
         mode="lines+markers+text", name=alarm_name,
         line=dict(color="#0072C6", width=3),
         marker=dict(size=8, color="#3498DB"),
-        text=weekly_df['per_bc'].round(2), textposition="top center",
+        text=plot_df['per_bc'].round(2), textposition="top center",
         textfont=dict(color="black", size=12)
     ))
     
@@ -386,6 +395,8 @@ def trigger_power_automate(html_body, prediction, recipients_str):
 def calculate_smart_forecast(df_filtered, weekly, current_week, total_hc):
     """
     UPGRADED ALGORITHM: Adaptive Bayesian Profile + Momentum Drift
+    1. Uses Exponential Decay (Recent weeks matter more for the profile).
+    2. Adds Momentum Factor (Detects if fleet performance is degrading).
     """
     # --- A. Context & Data Prep ---
     current_data = df_filtered[df_filtered['week'] == current_week]
@@ -510,6 +521,10 @@ def main():
         
         df, headcounts = load_data()
         
+        # Check for model warning
+        if st.session_state.get('model_warning'):
+            st.warning("⚠️ **Model Data Missing**: 'model.csv' not found. Bus models will show as 'Unknown'. Please upload 'model.csv' or set MODEL_URL in Azure.")
+        
         # Only stop if DF is totally empty (meaning load failed)
         if df.empty:
             st.warning("⚠️ Data is waiting to be loaded. Please ensure TELEMATICS_URL is set in Azure.")
@@ -556,7 +571,7 @@ def main():
         st.markdown('<div class="metric-card">', unsafe_allow_html=True)
         col_chart, col_text = st.columns([2, 1])
         with col_chart:
-            # MATCHING LOCAL: Passed raw weekly df only (removed the 3rd arg)
+            # FIXED: Removed the 3rd argument (projected_val) so it plots raw data (Actuals)
             st.plotly_chart(plot_trend_old_style(weekly.tail(12), alarm), use_container_width=True)
         with col_text:
             st.markdown("### 📋 Executive Brief")
