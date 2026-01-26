@@ -364,8 +364,6 @@ def trigger_power_automate(html_body, prediction, recipients_str):
     except: return False
 
 def calculate_smart_forecast(df_filtered, weekly, current_week, total_hc):
-    # This function now expects df_filtered to potentially be a SNAPSHOT
-    # current_week is just the last week ID in the provided DF
     latest_row = weekly.iloc[-1]
     current_data = df_filtered[df_filtered['week'] == current_week]
     
@@ -502,13 +500,12 @@ def main():
         # --- NEW DATE SELECTOR LOGIC ---
         col_date, col_status = st.columns([1, 2])
         with col_date:
-            # Calculate default date (Most recent Thursday)
+            # FIX: Default to LATEST available date (so view matches initial load 5.96)
+            # User can manually select Thursday to see "What if" logic
             max_dt = df_filtered['date'].max()
             if pd.isna(max_dt): max_dt = datetime.now()
-            days_to_thurs = (max_dt.weekday() - 3) % 7
-            default_thurs = max_dt - timedelta(days=days_to_thurs)
             
-            report_date = st.date_input("Drafting Date (Snapshot)", value=default_thurs, max_value=datetime.now())
+            report_date = st.date_input("Drafting Date (Snapshot)", value=max_dt, max_value=datetime.now())
         
         # Recalculate everything specifically for this snapshot
         snap_date_ts = pd.to_datetime(report_date)
@@ -537,7 +534,8 @@ def main():
             model_context_str = f"High volume observed in **{top_model}** buses ({model_pct:.1f}% of alarms)."
             
             with col_status:
-                st.metric("Projected Risk (As of Snapshot)", f"{snap_proj_val:.2f}", delta=f"Week {latest_wk_snap} Projection")
+                # FIX: delta_color="inverse" (Green is GOOD, Red is BAD)
+                st.metric("Projected Risk (As of Snapshot)", f"{snap_proj_val:.2f}", delta=f"Week {latest_wk_snap} Projection", delta_color="inverse")
         
             st.plotly_chart(plot_single_forecast_bar(snap_comp_df), use_container_width=True)
             st.dataframe(snap_comp_df, use_container_width=True)
@@ -549,7 +547,8 @@ def main():
             with c_email_btn:
                 # Use Snapshot Value for Logic
                 if snap_proj_val > 5.0:
-                    st.info("Risk Level Critical: Alert Generation Enabled.")
+                    # FIX: Red Box for Critical Risk
+                    st.error("🚨 Risk Level Critical: Alert Generation Enabled.")
                     recipients = st.text_input("Recipients", "devi02@smrt.com.sg; fleet_ops@smrt.com.sg")
                     
                     if st.button("📝 Draft Alert Email"):
@@ -558,7 +557,8 @@ def main():
                             diff = snap_proj_val - avg_4
                             trend_txt = f"{((snap_proj_val - avg_4)/avg_4)*100:.1f}% vs 4-wk avg"
                             
-                            offender_list = wk_payload_snap['top_15_toxic_combinations'][:5]
+                            # CORRECT KEY REFERENCE HERE
+                            offender_list = wk_payload_snap['top_contributors'][:5]
                             offender_str = "\n".join([f"<tr><td>{i['depot_id']}</td><td>{i['svc_no']}</td><td>{i['bus_no']}</td><td>{i['model']}</td><td>{i['driver_id']}</td><td>{i['count']}</td></tr>" for i in offender_list])
                             
                             with st.spinner("Drafting email..."):
