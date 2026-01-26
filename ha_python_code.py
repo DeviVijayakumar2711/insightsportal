@@ -125,7 +125,6 @@ SCENARIO:
 * **Metric:** {alarm}
 * **Projected Value:** {projection}
 * **Trend Context:** {trend_context}
-* **Model Insight:** {model_context}
 * **Top Contributors Data:** {offender_data}
 
 INSTRUCTIONS:
@@ -137,7 +136,7 @@ Follow this exact structure:
   <strong>Context:</strong> {trend_context}
 </p>
 <h3 style="color: #b91c1c;">Analysis</h3>
-<p>[Write 2 sentences analyzing the 'Top Contributors Data'. Explicitly mention the {model_context} as a key driver if applicable. Use neutral language.]</p>
+<p>[Write 2 sentences analyzing the 'Top Contributors Data'. Use neutral language.]</p>
 <h3>Top Contributors</h3>
 <table border="1" cellpadding="5" cellspacing="0" style="border-collapse: collapse; width: 100%;">
   <tr style="background-color: #f2f2f2;"><th>Depot</th><th>Service</th><th>Bus</th><th>Model</th><th>Driver</th><th>Count</th></tr>
@@ -452,7 +451,6 @@ def main():
 
     if not depots: st.stop()
     
-    # Global Filter (Full Data)
     df_filtered, weekly, wk_payload, wk4_payload, latest_wk_num = process_metrics(
         df, headcounts, alarm, depots, exclude_null_driver, only_completed
     )
@@ -460,8 +458,6 @@ def main():
     
     hc_mask = headcounts['depot_id'].isin(depots)
     total_hc = headcounts[hc_mask]['headcount'].sum()
-    
-    # Calculate Forecast for Tab 3 (Default View)
     final_projected_val, comp_df, explainer = calculate_smart_forecast(df_filtered, weekly, latest_wk_num, total_hc)
 
     st.markdown(f"## {ALARM_MAP[alarm]['long']} Intelligence Hub")
@@ -477,7 +473,7 @@ def main():
             st.write(st.session_state.exec_brief)
         else: st.info("AI Not Connected")
 
-    t1, t2, t3 = st.tabs(["📊 Weekly Deep Dive", "🧠 4-Week Pattern", "🔮 Risk Forecast"])
+    t1, t2, t3 = st.tabs(["📊 Weekly Deep Dive", "🧠 4-Week Pattern", "🔮 Risk Forecast & Alert"])
     
     with t1:
         c1, c2 = st.columns([1, 2])
@@ -496,96 +492,50 @@ def main():
 
     with t3:
         st.markdown('<div class="metric-card">', unsafe_allow_html=True)
+        st.plotly_chart(plot_single_forecast_bar(comp_df), use_container_width=True)
+        st.dataframe(comp_df, use_container_width=True)
+        st.markdown("---")
         
-        # --- NEW DATE SELECTOR LOGIC ---
-        col_date, col_status = st.columns([1, 2])
-        with col_date:
-            # FIX: Default to LATEST available date (so view matches initial load 5.96)
-            # User can manually select Thursday to see "What if" logic
-            max_dt = df_filtered['date'].max()
-            if pd.isna(max_dt): max_dt = datetime.now()
-            
-            report_date = st.date_input("Drafting Date (Snapshot)", value=max_dt, max_value=datetime.now())
+        st.subheader("📢 Escalation Protocol")
+        c_email_btn, c_email_prev = st.columns([1, 2])
         
-        # Recalculate everything specifically for this snapshot
-        snap_date_ts = pd.to_datetime(report_date)
-        df_snap = df_filtered[df_filtered['date'] <= snap_date_ts]
-        
-        if not df_snap.empty:
-            # Re-run metrics for snapshot
-            _, weekly_snap, wk_payload_snap, _, latest_wk_snap = process_metrics(
-                df, headcounts, alarm, depots, exclude_null_driver, only_completed
-            )
-            # Filter weekly to match snapshot cut-off
-            weekly_snap = weekly_snap[weekly_snap['week'] <= latest_wk_snap]
-            
-            # Recalculate Forecast on Snapshot
-            snap_proj_val, snap_comp_df, snap_explainer = calculate_smart_forecast(df_snap, weekly_snap, latest_wk_snap, total_hc)
-            
-            # Model Insights for Email
-            top_model = "Unknown"
-            model_pct = 0
-            if 'model' in df_snap.columns:
-                m_counts = df_snap['model'].value_counts()
-                if not m_counts.empty:
-                    top_model = m_counts.idxmax()
-                    model_pct = (m_counts.max() / len(df_snap)) * 100
-            
-            model_context_str = f"High volume observed in **{top_model}** buses ({model_pct:.1f}% of alarms)."
-            
-            with col_status:
-                # FIX: delta_color="inverse" (Green is GOOD, Red is BAD)
-                st.metric("Projected Risk (As of Snapshot)", f"{snap_proj_val:.2f}", delta=f"Week {latest_wk_snap} Projection", delta_color="inverse")
-        
-            st.plotly_chart(plot_single_forecast_bar(snap_comp_df), use_container_width=True)
-            st.dataframe(snap_comp_df, use_container_width=True)
-            
-            st.markdown("---")
-            st.subheader("📢 Escalation Protocol")
-            c_email_btn, c_email_prev = st.columns([1, 2])
-            
-            with c_email_btn:
-                # Use Snapshot Value for Logic
-                if snap_proj_val > 5.0:
-                    # FIX: Red Box for Critical Risk
-                    st.error("🚨 Risk Level Critical: Alert Generation Enabled.")
-                    recipients = st.text_input("Recipients", "devi02@smrt.com.sg; fleet_ops@smrt.com.sg")
-                    
-                    if st.button("📝 Draft Alert Email"):
-                         if llm:
-                            avg_4 = weekly_snap.tail(4)['per_bc'].mean() if len(weekly_snap) > 1 else snap_proj_val
-                            diff = snap_proj_val - avg_4
-                            trend_txt = f"{((snap_proj_val - avg_4)/avg_4)*100:.1f}% vs 4-wk avg"
-                            
-                            # CORRECT KEY REFERENCE HERE
-                            offender_list = wk_payload_snap['top_contributors'][:5]
-                            offender_str = "\n".join([f"<tr><td>{i['depot_id']}</td><td>{i['svc_no']}</td><td>{i['bus_no']}</td><td>{i['model']}</td><td>{i['driver_id']}</td><td>{i['count']}</td></tr>" for i in offender_list])
-                            
-                            with st.spinner("Drafting email..."):
-                                st.session_state.email_html_draft = llm.predict(PROMPT_ALERT_EMAIL.format(
-                                    alarm=alarm, projection=f"{snap_proj_val:.2f}", 
-                                    trend_context=trend_txt, model_context=model_context_str, offender_data=offender_str
-                                ))
-                         else: st.error("AI not connected")
+        with c_email_btn:
+            if final_projected_val > 5.0:
+                st.info("Risk Level Critical: Alert Generation Enabled.")
+                recipients = st.text_input("Recipients", "devi02@smrt.com.sg; fleet_ops@smrt.com.sg")
+                
+                if st.button("📝 Draft Alert Email"):
+                     if llm:
+                        avg_4 = weekly.tail(4)['per_bc'].mean()
+                        diff = final_projected_val - avg_4
+                        pct_diff = (diff / avg_4) * 100 if avg_4 > 0 else 0
+                        trend_txt = f"{abs(pct_diff):.1f}% {'higher' if diff > 0 else 'lower'} than 4-wk average"
+                        
+                        offender_list = wk_payload['top_contributors'][:5]
+                        offender_str = "\n".join([f"<tr><td>{i['depot_id']}</td><td>{i['svc_no']}</td><td>{i['bus_no']}</td><td>{i['model']}</td><td>{i['driver_id']}</td><td>{i['count']}</td></tr>" for i in offender_list])
+                        
+                        with st.spinner("Drafting email..."):
+                            st.session_state.email_html_draft = llm.predict(PROMPT_ALERT_EMAIL.format(
+                                alarm=alarm, projection=f"{final_projected_val:.2f}", 
+                                trend_context=trend_txt, offender_data=offender_str
+                            ))
+                     else: st.error("AI not connected")
 
-                    if "email_html_draft" in st.session_state:
-                        if st.button("📨 Send via Power Automate"):
-                            if trigger_power_automate(st.session_state.email_html_draft, snap_proj_val, recipients):
-                                st.success("Alert Sent Successfully")
-                            else: st.error("Transmission Failed")
-                else: st.success(f"Risk {snap_proj_val:.2f} is below Critical Threshold (5.0). Escalation inactive.")
+                if "email_html_draft" in st.session_state:
+                    if st.button("📨 Send via Power Automate"):
+                        if trigger_power_automate(st.session_state.email_html_draft, final_projected_val, recipients):
+                            st.success("Alert Sent Successfully")
+                        else: st.error("Transmission Failed")
+            else: st.success("Current Risk is below Critical Threshold (5.0). Escalation Protocol is inactive.")
 
-            with c_email_prev:
-                if "email_html_draft" in st.session_state and snap_proj_val > 5.0:
-                    st.markdown("**Email Preview:**")
-                    st.components.v1.html(st.session_state.email_html_draft, height=300, scrolling=True)
-        else:
-            st.warning("No data found before selected date.")
+        with c_email_prev:
+            if "email_html_draft" in st.session_state and final_projected_val > 5.0:
+                st.markdown("**Email Preview:**")
+                st.components.v1.html(st.session_state.email_html_draft, height=300, scrolling=True)
 
         st.markdown('</div>', unsafe_allow_html=True)
         with st.expander("🧠 Forecast Logic"):
-            if 'snap_explainer' in locals():
-                st.markdown(f"Day: **{snap_explainer['day']}**. Completion: **{snap_explainer['completion_rate']*100:.0f}%**.")
+            st.markdown(f"Day: **{explainer['day']}**. Completion: **{explainer['completion_rate']*100:.0f}%**.")
 
     st.markdown("---")
     st.subheader("💬 Root Cause Analyst")
@@ -602,20 +552,28 @@ def main():
         with st.chat_message("assistant"):
             if llm:
                 with st.spinner("Analyzing full dataset..."):
+                    # EXPANDED CONTEXT FOR AI (HISTORY + CURRENT)
                     full_chat_context = {
                         "trend_history": weekly[['year', 'week', 'count', 'per_bc']].to_dict(orient='records'),
                         "current_week_deep_dive": wk_payload,
                         "4_week_summary": wk4_payload
                     }
+                    
                     system_instructions = f"""
                     You are a data analyst using the full context provided (History + Current).
                     Context: {json.dumps(full_chat_context, cls=NpEncoder)}
+                    
                     **Handling 'What-If' Questions:**
                     1. If user asks "What if we remove [MODEL]?", check 'current_week_deep_dive' -> 'model_breakdown'.
                     2. Subtract that model's alarms from 'total_alarms'.
                     3. Recalculate rate = (New Total / total_headcount).
-                    **Handling History Questions:** Use 'trend_history'.
+                    4. Show the math clearly.
+                    
+                    **Handling History Questions:**
+                    1. Use 'trend_history' for past weeks.
+                    2. Sum up counts/rates as requested.
                     """
+                    
                     response = llm.predict(f"{system_instructions}\nUser Question: {user_val}")
                     st.markdown(response)
                     st.session_state.chat_log.append({"role": "assistant", "content": response})
