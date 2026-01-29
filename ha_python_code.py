@@ -17,8 +17,17 @@ except ImportError:
 # Load local .env file (for local development only)
 load_dotenv()
 
-# --- 1. CONFIGURATION HELPER ---
+# ==========================================
+# 🔧 CONFIGURATION (POWER AUTOMATE LINK)
+# ==========================================
+# I have embedded your specific link here so it works instantly on Azure
+HARDCODED_PA_URL = "https://defaultc88daf55f4aa4f79a143526402ab9a.23.environment.api.powerplatform.com:443/powerautomate/automations/direct/workflows/9c97356356884121962f780d0b6e5e89/triggers/manual/paths/invoke?api-version=1&sp=%2Ftriggers%2Fmanual%2Frun&sv=1.0&sig=SbOZpTqO5gOax1mz06R0dJBVvLt3mN2t2tp3lDGfiv4"
+
+# --- 1. CONFIGURATION HELPER (Azure + Local) ---
 def get_config(key, default=""):
+    """
+    Retrieves configuration from Azure Environment Variables first.
+    """
     if key in os.environ:
         return os.environ[key]
     
@@ -138,7 +147,7 @@ Follow this exact structure:
 </p>
 <h3 style="color: #b91c1c;">Analysis</h3>
 <p>[Write 2-3 sentences analyzing the 'Top Contributors Data'. Explicitly mention the Model Distribution ({model_context}) to highlight if EVs or specific models are the main cause. Use neutral language.]</p>
-<h3>Top Contributors (High Frequency)</h3>
+<h3>Top 10 Contributors (High Frequency)</h3>
 <table border="1" cellpadding="5" cellspacing="0" style="border-collapse: collapse; width: 100%;">
   <tr style="background-color: #f2f2f2;"><th>Depot</th><th>Service</th><th>Bus</th><th>Model</th><th>Driver</th><th>Count</th></tr>
   [Generate rows from offender_data]
@@ -184,12 +193,12 @@ class NpEncoder(json.JSONEncoder):
 
 @st.cache_data
 def load_data():
-    """Robust Data Loader with Diagnostics"""
+    """Smart Data Loader: Handles Azure URL or Local File with Absolute Paths"""
     path_tele = get_config("TELEMATICS_URL", "telematics_new_data_2207.csv")
     path_head = get_config("HEADCOUNTS_URL", "depot_headcounts.csv")
     path_excl = get_config("EXCLUSIONS_URL", "vehicle_exclusions.csv")
     
-    # Robust Pathing
+    # Absolute path fix for local files in Azure
     base_dir = os.path.dirname(os.path.abspath(__file__))
     path_model_url = get_config("MODEL_URL", "").strip()
     path_model_local = os.path.join(base_dir, "model.csv")
@@ -200,13 +209,19 @@ def load_data():
         if not path_val: return pd.DataFrame()
         path_str = str(path_val).strip()
         
+        # A) URL Read (Azure Blob)
         if path_str.lower().startswith("http"):
             try:
                 return pd.read_csv(path_str)
             except Exception as e:
-                if is_required: st.error(f"❌ Read Error ({path_str}): {e}")
+                if is_required:
+                    if "403" in str(e):
+                        st.error(f"❌ **Azure Access Denied (403)**: SAS Token likely expired for `{path_str}`.")
+                    else:
+                        st.error(f"❌ **Azure Connection Error**: {e}")
                 return pd.DataFrame()
         
+        # B) Local File Read
         if not os.path.isabs(path_str): path_str = os.path.join(base_dir, path_str)
         if os.path.exists(path_str):
             return pd.read_csv(path_str)
@@ -220,7 +235,7 @@ def load_data():
 
     if df.empty: return pd.DataFrame(), pd.DataFrame(), diagnostics
 
-    # Clean Main DF
+    # Pre-process Telematics
     df.columns = [c.lower().strip() for c in df.columns]
     for c in ['bus_no', 'driver_id', 'alarm_type', 'depot_id', 'svc_no']:
         if c in df.columns: 
@@ -231,16 +246,26 @@ def load_data():
             if c == 'driver_id':
                 df[c] = df[c].astype(str).str.replace(r'\.0$', '', regex=True)
 
-    # --- MODEL LOADING ---
+    # --- MODEL LOADING & EV LOGIC ---
     bus_models = pd.DataFrame()
+    
+    # 1. Try URL
     if path_model_url:
-        try: bus_models = pd.read_csv(path_model_url); diagnostics['model_status'] = "Loaded from URL"
-        except Exception as e: diagnostics['model_status'] = f"URL Failed: {str(e)}"
+        try:
+            bus_models = pd.read_csv(path_model_url)
+            diagnostics['model_status'] = "Loaded from URL"
+        except Exception as e:
+            diagnostics['model_status'] = f"URL Failed: {str(e)}"
     
+    # 2. Try Local if URL failed or empty
     if bus_models.empty and os.path.exists(path_model_local):
-        try: bus_models = pd.read_csv(path_model_local); diagnostics['model_status'] = "Loaded from Local File"
-        except Exception as e: diagnostics['model_status'] = f"Local Read Failed: {str(e)}"
+        try:
+            bus_models = pd.read_csv(path_model_local)
+            diagnostics['model_status'] = "Loaded from Local File"
+        except Exception as e:
+            diagnostics['model_status'] = f"Local Read Failed: {str(e)}"
     
+    # 3. Merge Logic
     if not bus_models.empty:
         bus_models.columns = [c.lower().strip().replace(' ', '_').replace('.', '') for c in bus_models.columns]
         diagnostics['model_cols'] = list(bus_models.columns)
@@ -256,9 +281,7 @@ def load_data():
                 df = df.merge(bus_models[['bus_no', 'model']], on='bus_no', how='left')
                 df['model'] = df['model'].fillna('Unknown')
                 
-                # --- NEW: EV BUS INDICATION ---
-                # Automatically tag BYD and ZHONGTONG as EV in the data source
-                # This ensures charts, email, and LLM all see them as EVs
+                # --- NEW: Tag EV Buses ---
                 def tag_ev(model_name):
                     if not isinstance(model_name, str): return model_name
                     upper_m = model_name.upper()
@@ -278,7 +301,6 @@ def load_data():
             
     if 'model' not in df.columns: df['model'] = 'Unknown'
 
-    # Headcounts & Exclusions
     if 'depot_id' in headcounts.columns:
         headcounts['depot_id'] = headcounts['depot_id'].astype(str).str.strip().str.upper()
     else:
@@ -369,13 +391,42 @@ def plot_single_forecast_bar(comp_df):
     fig.update_layout(title="Risk Timeline", margin=dict(l=20, r=20, t=40, b=20), height=350)
     return fig
 
+# --- FIXED: Robust Power Automate Function ---
 def trigger_power_automate(html_body, prediction, recipients_str):
+    """
+    Triggers a Power Automate flow via HTTP POST.
+    Checks hardcoded variable first, then env variable.
+    """
     try:
-        url = get_config("POWER_AUTOMATE_FLOW_URL")
-        if not url: return False
-        requests.post(url, json={"subject": f"⚠️ ALERT: Rate {prediction:.2f}", "body": html_body, "recipient": recipients_str}, timeout=6)
-        return True
-    except: return False
+        # Check Hardcoded first, then Env
+        url = HARDCODED_PA_URL
+        if not url:
+            url = get_config("POWER_AUTOMATE_FLOW_URL")
+        
+        if not url:
+            st.error("❌ Configuration Error: URL missing. Please set POWER_AUTOMATE_URL in the code or Azure settings.")
+            return False
+        
+        # Prepare Payload
+        payload = {
+            "subject": f"⚠️ ALERT: Rate {prediction:.2f}", 
+            "body": html_body, 
+            "recipient": recipients_str
+        }
+        
+        # Send Request with explicit timeout
+        response = requests.post(url, json=payload, timeout=10)
+        
+        # Validate Status Code
+        if response.status_code in [200, 202]:
+            return True
+        else:
+            st.error(f"❌ Transmission Failed: Server returned {response.status_code}. Details: {response.text}")
+            return False
+            
+    except Exception as e:
+        st.error(f"❌ Connection Error: {str(e)}")
+        return False
 
 def calculate_smart_forecast(df_filtered, weekly, current_week, total_hc):
     latest_row = weekly.iloc[-1]
@@ -518,7 +569,7 @@ def main():
             if pd.isna(max_dt): max_dt = datetime.now()
             report_date = st.date_input("Drafting Date (Snapshot)", value=max_dt, max_value=datetime.now())
         
-        # Recalculate snapshot
+        # Snapshot Logic
         snap_date_ts = pd.to_datetime(report_date)
         df_snap = df_filtered[df_filtered['date'] <= snap_date_ts]
         
@@ -534,7 +585,6 @@ def main():
             model_context_str = "Model breakdown not available."
             if 'model' in df_snap.columns:
                 m_counts = df_snap['model'].value_counts(normalize=True) * 100
-                # Get Top 3 contributors with percentages
                 top_models_str = ", ".join([f"{k}: {v:.1f}%" for k, v in m_counts.head(3).items()])
                 model_context_str = f"Top Contributing Models: {top_models_str}."
             
