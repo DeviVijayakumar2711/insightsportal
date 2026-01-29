@@ -16,9 +16,13 @@ except ImportError:
 
 load_dotenv()
 
-# --- CONFIGURATION (POWER AUTOMATE LINK) ---
+# ==========================================
+# 🔧 CONFIGURATION (POWER AUTOMATE LINK)
+# ==========================================
+# Hardcoded link to ensure it works immediately on Azure
 HARDCODED_PA_URL = "https://defaultc88daf55f4aa4f79a143526402ab9a.23.environment.api.powerplatform.com:443/powerautomate/automations/direct/workflows/9c97356356884121962f780d0b6e5e89/triggers/manual/paths/invoke?api-version=1&sp=%2Ftriggers%2Fmanual%2Frun&sv=1.0&sig=SbOZpTqO5gOax1mz06R0dJBVvLt3mN2t2tp3lDGfiv4"
 
+# --- 1. CONFIGURATION HELPER ---
 def get_config(key, default=""):
     if key in os.environ: return os.environ[key]
     if os.path.exists(".streamlit/secrets.toml"):
@@ -26,7 +30,7 @@ def get_config(key, default=""):
         except: pass
     return default
 
-# --- PAGE CONFIG ---
+# --- 2. PAGE CONFIG & CSS ---
 st.set_page_config(page_title="Fleet Operations Center", page_icon="🚍", layout="wide")
 
 st.markdown("""
@@ -37,7 +41,7 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# --- PROMPTS ---
+# --- 3. PROMPTS ---
 ALARM_MAP = {
     "HA": {"long": "Harsh Acceleration", "short": "HA"},
     "HB": {"long": "Harsh Braking",      "short": "HB"},
@@ -114,7 +118,7 @@ Follow this exact structure:
 <p>{breakdown_context}</p>
 
 <h3 style="color: #b91c1c;">Analysis</h3>
-<p>[Write 2 sentences analyzing the 'Top Contributing Factors'. Use neutral language.]</p>
+<p>[Write 2 sentences analyzing the 'Top Contributing Factors'. Explicitly mention if specific models (like EV) are driving the trend. Use neutral language.]</p>
 
 <h3>Top Contributing Factors</h3>
 <table border="1" cellpadding="5" cellspacing="0" style="border-collapse: collapse; width: 100%;">
@@ -130,7 +134,7 @@ Follow this exact structure:
 <p>Best regards,<br>Data Analytics Team</p>
 """
 
-# --- AI SETUP ---
+# --- 4. AI SETUP (Missing Function Fixed Here) ---
 @st.cache_resource
 def initialize_llm():
     try:
@@ -152,7 +156,7 @@ def initialize_llm():
         print(f"LLM Init Error: {e}")
         return None
 
-# --- DATA LOGIC ---
+# --- 5. DATA LOGIC ---
 class NpEncoder(json.JSONEncoder):
     def default(self, obj):
         if isinstance(obj, (np.integer, np.floating)): return float(obj)
@@ -161,49 +165,62 @@ class NpEncoder(json.JSONEncoder):
 
 @st.cache_data
 def load_data():
+    """Robust Data Loader with Diagnostics"""
     path_tele = get_config("TELEMATICS_URL", "telematics_new_data_2207.csv")
     path_head = get_config("HEADCOUNTS_URL", "depot_headcounts.csv")
     path_excl = get_config("EXCLUSIONS_URL", "vehicle_exclusions.csv")
     
+    # Robust Pathing for Azure
     base_dir = os.path.dirname(os.path.abspath(__file__))
     path_model_url = get_config("MODEL_URL", "").strip()
     path_model_local = os.path.join(base_dir, "model.csv")
 
     diagnostics = {"model_status": "Not Attempted", "model_cols": [], "merge_count": 0}
 
-    def smart_read(p, is_req=False):
-        if not p: return pd.DataFrame()
-        p_str = str(p).strip()
-        if p_str.lower().startswith("http"):
-            try: return pd.read_csv(p_str)
-            except Exception as e: 
-                if is_req: st.error(f"Read Error: {e}")
+    def smart_read(path_val, is_required=False):
+        if not path_val: return pd.DataFrame()
+        path_str = str(path_val).strip()
+        
+        # A) URL Read
+        if path_str.lower().startswith("http"):
+            try:
+                return pd.read_csv(path_str)
+            except Exception as e:
+                if is_required: st.error(f"Read Error: {e}")
                 return pd.DataFrame()
         
-        if not os.path.isabs(p_str): p_str = os.path.join(base_dir, p_str)
-        return pd.read_csv(p_str) if os.path.exists(p_str) else pd.DataFrame()
+        # B) Local Read
+        if not os.path.isabs(path_str): path_str = os.path.join(base_dir, path_str)
+        if os.path.exists(path_str):
+            return pd.read_csv(path_str)
+        else:
+            if is_required: st.error(f"File Not Found: {path_str}")
+            return pd.DataFrame()
 
     df = smart_read(path_tele, True)
     headcounts = smart_read(path_head)
     exclusions = smart_read(path_excl)
     
-    # Model Loading
+    # Model Loading (Hybrid)
     bus_models = pd.DataFrame()
     if path_model_url:
         try: bus_models = pd.read_csv(path_model_url); diagnostics['model_status'] = "URL Loaded"
         except: pass
+    
     if bus_models.empty and os.path.exists(path_model_local):
-        bus_models = pd.read_csv(path_model_local)
-        diagnostics['model_status'] = "Local Loaded"
+        try: bus_models = pd.read_csv(path_model_local); diagnostics['model_status'] = "Local Loaded"
+        except: pass
 
     if df.empty: return pd.DataFrame(), pd.DataFrame(), diagnostics
 
+    # Clean Telematics
     df.columns = [c.lower().strip() for c in df.columns]
     for c in ['bus_no', 'driver_id', 'alarm_type', 'depot_id', 'svc_no']:
-        if c in df.columns:
+        if c in df.columns: 
             df[c] = df[c].astype(str).str.strip().str.upper().replace(['NAN', 'NULL'], None)
             if c == 'driver_id': df[c] = df[c].str.replace(r'\.0$', '', regex=True)
 
+    # Merge Models
     if not bus_models.empty:
         bus_models.columns = [c.lower().strip().replace(' ', '_') for c in bus_models.columns]
         found_id = next((c for c in bus_models.columns if c in ['bus_no', 'bus_number', 'vehicle_no']), None)
@@ -211,32 +228,39 @@ def load_data():
         if found_id:
             bus_models.rename(columns={found_id: 'bus_no'}, inplace=True)
             bus_models['bus_no'] = bus_models['bus_no'].astype(str).str.strip().str.upper()
+            
             if 'model' in bus_models.columns:
                 df = df.merge(bus_models[['bus_no', 'model']], on='bus_no', how='left')
                 df['model'] = df['model'].fillna('Unknown')
                 
-                # EV Logic
+                # EV Tagging Logic
                 def tag_ev(m):
                     if not isinstance(m, str): return "Unknown"
-                    return f"{m} (EV)" if "BYD" in m.upper() or "ZHONGTONG" in m.upper() and "(EV)" not in m else m
+                    upper_m = m.upper()
+                    if ('BYD' in upper_m or 'ZHONGTONG' in upper_m) and '(EV)' not in m:
+                        return f"{m} (EV)"
+                    return m
                 
                 df['model'] = df['model'].apply(tag_ev)
                 diagnostics['merge_count'] = len(df[df['model'] != 'Unknown'])
 
     if 'model' not in df.columns: df['model'] = 'Unknown'
-    
+
     # Filter Exclusions
     if not exclusions.empty and 'bus_no' in exclusions.columns:
         excl_list = set(exclusions['bus_no'].astype(str).str.strip().str.upper())
         df = df[~df['bus_no'].isin(excl_list)]
 
+    # Clean Headcounts
     if 'depot_id' in headcounts.columns:
         headcounts['depot_id'] = headcounts['depot_id'].astype(str).str.strip().str.upper()
+    else:
+        headcounts = pd.DataFrame(columns=['depot_id', 'headcount'])
 
     df['date'] = pd.to_datetime(df.get('alarm_calendar_date'), dayfirst=True, errors='coerce')
     df['year'] = df['date'].dt.isocalendar().year
     df['week'] = df['date'].dt.isocalendar().week
-    df['day_of_week'] = df['date'].dt.dayofweek
+    df['day_of_week'] = df['date'].dt.dayofweek 
     
     return df, headcounts, diagnostics
 
@@ -246,7 +270,7 @@ def process_metrics(df, headcounts, alarm_type, depots, exclude_null, only_comp)
     
     df_filtered = df[mask].copy()
     if df_filtered.empty: return df_filtered, pd.DataFrame(), {}, {}, 0
-    
+
     weekly = df_filtered.groupby(['year', 'week']).size().reset_index(name='count')
     hc_mask = headcounts['depot_id'].isin(depots)
     total_hc = headcounts[hc_mask]['headcount'].sum()
@@ -262,31 +286,32 @@ def process_metrics(df, headcounts, alarm_type, depots, exclude_null, only_comp)
     if 'model' not in df_curr.columns: df_curr['model'] = 'Unknown'
 
     wk_payload = {
-        "week": int(latest_wk), 
-        "total_alarms": int(len(df_curr)), 
-        "total_hc": int(total_hc),
+        "week": int(latest_wk),
+        "total_alarms": int(len(df_curr)),
+        "total_headcount": int(total_hc),
         "depot_breakdown": df_curr['depot_id'].value_counts().to_dict(),
         "model_breakdown": df_curr['model'].value_counts().to_dict(),
         "top_contributors": df_curr.groupby(['depot_id', 'svc_no', 'bus_no', 'model', 'driver_id']).size().sort_values(ascending=False).head(15).reset_index(name='count').to_dict(orient='records')
     }
     
-    # 4-Week Payload
     df_4wk = df_filtered[df_filtered['week'] >= (latest_wk - 3)]
     wk4_payload = {
         "drivers": df_4wk.groupby(['driver_id', 'week']).size().unstack(fill_value=0).sum(axis=1).to_dict()
     }
+    
     return df_filtered, weekly, wk_payload, wk4_payload, latest_wk
 
 def calculate_smart_forecast(df_filtered, weekly, current_week, total_hc):
+    latest_row = weekly.iloc[-1]
     current_data = df_filtered[df_filtered['week'] == current_week]
     
     if not current_data.empty:
-        max_day_idx = current_data['date'].max().weekday()
-        day_name = current_data['date'].max().strftime('%A')
+        last_data_dt = current_data['date'].max()
+        max_day_idx = last_data_dt.weekday()
+        day_name = last_data_dt.strftime('%A')
     else:
         max_day_idx = 0; day_name = "Monday"
 
-    # Calc completion rate from past 12 weeks
     past_weeks = weekly[weekly['week'] < current_week]['week'].unique()[-12:]
     ratios = []
     for w in past_weeks:
@@ -299,7 +324,6 @@ def calculate_smart_forecast(df_filtered, weekly, current_week, total_hc):
     
     hc = max(1, total_hc)
     
-    # Momentum (Slope)
     momentum = 1.0
     if len(weekly) >= 5:
         rates = weekly[weekly['week'] < current_week].tail(4)['per_bc'].values
@@ -307,7 +331,6 @@ def calculate_smart_forecast(df_filtered, weekly, current_week, total_hc):
             s, _ = np.polyfit(np.arange(len(rates)), rates, 1)
             if s > 0: momentum = 1 + (s * 0.5)
 
-    # Projection Logic
     comp_rows = []
     display_weeks = weekly['week'].unique()[-5:]
     
@@ -320,7 +343,6 @@ def calculate_smart_forecast(df_filtered, weekly, current_week, total_hc):
             raw = count_sofar / comp_rate
             adj = raw * momentum
             
-            # Weighted mix of Avg and Projection
             avg_4 = weekly[weekly['week'] < w].tail(4)['per_bc'].mean()
             if pd.isna(avg_4): avg_4 = count_sofar/hc
             
@@ -336,10 +358,8 @@ def calculate_smart_forecast(df_filtered, weekly, current_week, total_hc):
 def plot_trend_old_style(weekly_df, alarm_name):
     fig = go.Figure()
     if weekly_df.empty: return fig
-    
     max_y = max(6, weekly_df['per_bc'].max() * 1.1)
     
-    # Zones
     fig.add_hrect(y0=0, y1=3, line_width=0, fillcolor="rgba(46, 204, 113, 0.15)", layer="below")
     fig.add_hrect(y0=3, y1=5, line_width=0, fillcolor="rgba(241, 196, 15, 0.15)", layer="below")
     fig.add_hrect(y0=5, y1=max_y, line_width=0, fillcolor="rgba(231, 76, 60, 0.15)", layer="below")
@@ -360,38 +380,46 @@ def plot_single_forecast_bar(comp_df):
     fig.update_layout(title="Risk Timeline", height=350, margin=dict(l=20, r=20, t=40, b=20))
     return fig
 
-# --- APP START ---
+# --- 7. MAIN APP ---
 def main():
     llm = initialize_llm()
     
     with st.sidebar:
         st.markdown("### 🎛️ Control Panel")
-        if st.button("🔄 Reset Cache"): st.cache_data.clear(); st.rerun()
+        if st.button("🔄 Reset Cache & Reload"):
+            st.cache_data.clear()
+            st.rerun()
+            
         alarm = st.selectbox("Alarm Type", list(ALARM_MAP.keys()))
         df, headcounts, diag = load_data()
         
         with st.expander("🛠️ Diagnostics"):
             st.write(f"Status: {diag.get('model_status')}")
-            st.write(f"Matched: {diag.get('merge_count')}")
+            st.write(f"Matched: {diag.get('merge_count')} records")
             
-        if df.empty: st.warning("Data Missing"); st.stop()
-        
+        if df.empty:
+            st.warning("⚠️ Data Missing. Check Azure URLs.")
+            st.stop()
+            
         depot_opts = sorted(headcounts['depot_id'].unique())
-        depots = st.multiselect("Depots", depot_opts, default=depot_opts[:2])
-        only_comp = st.checkbox("Only completed weeks", True)
-        excl_null = st.checkbox("Exclude null drivers", True)
+        default_depots = [d for d in depot_opts if d in ["WDLAND", "KRANJI", "JURONG"]]
+        if not default_depots: default_depots = depot_opts[:2]
+        
+        depots = st.multiselect("Depots", depot_opts, default=default_depots)
+        only_comp = st.checkbox("Only completed weeks", value=True)
+        excl_null = st.checkbox("Exclude null drivers", value=True)
 
     if not depots: st.stop()
     
-    # Global Process
     df_filtered, weekly, wk_payload, wk4_payload, latest_wk = process_metrics(
         df, headcounts, alarm, depots, excl_null, only_comp
     )
-    if weekly.empty: st.stop()
+    if weekly.empty: st.warning("No Data Found"); st.stop()
     
-    total_hc = headcounts[headcounts['depot_id'].isin(depots)]['headcount'].sum()
+    hc_mask = headcounts['depot_id'].isin(depots)
+    total_hc = headcounts[hc_mask]['headcount'].sum()
     
-    # Initial Calculation
+    # Calculate Forecast
     proj_val, comp_df, explainer = calculate_smart_forecast(df_filtered, weekly, latest_wk, total_hc)
 
     st.markdown(f"## {ALARM_MAP[alarm]['long']} Intelligence Hub")
@@ -407,7 +435,7 @@ def main():
             st.write(st.session_state.exec_brief)
         else: st.info("AI Not Connected")
 
-    t1, t2, t3 = st.tabs(["📊 Weekly", "🧠 Pattern", "🔮 Risk & Alert"])
+    t1, t2, t3 = st.tabs(["📊 Weekly Deep Dive", "🧠 4-Week Pattern", "🔮 Risk Forecast"])
     
     with t1:
         c1, c2 = st.columns([1, 2])
@@ -430,7 +458,7 @@ def main():
         with c_date:
             max_dt = df_filtered['date'].max()
             if pd.isna(max_dt): max_dt = datetime.now()
-            report_date = st.date_input("Drafting Date", value=max_dt, max_value=datetime.now())
+            report_date = st.date_input("Drafting Date (Snapshot)", value=max_dt, max_value=datetime.now())
         
         # Snapshot Logic
         snap_dt = pd.to_datetime(report_date)
@@ -443,23 +471,22 @@ def main():
             snap_val, snap_comp_df, snap_exp = calculate_smart_forecast(df_snap, weekly_snap, wk_num_snap, total_hc)
             
             with c_stat:
-                st.metric("Projected Risk", f"{snap_val:.2f}", delta_color="inverse")
+                st.metric("Projected Risk (As of Snapshot)", f"{snap_val:.2f}", delta=f"W{wk_num_snap} Projection", delta_color="inverse")
             
             st.plotly_chart(plot_single_forecast_bar(snap_comp_df), use_container_width=True)
             
-            # --- EMAIL SECTION ---
             st.markdown("---")
             st.subheader("📢 Escalation Protocol")
             c_email_btn, c_email_prev = st.columns([1, 2])
             
             with c_email_btn:
                 if snap_val > 5.0:
-                    st.error("🚨 Critical Risk Enabled")
+                    st.error("🚨 Risk Level Critical: Alert Generation Enabled.")
                     recipients = st.text_input("Recipients", "devi02@smrt.com.sg; fleet_ops@smrt.com.sg")
                     
                     if st.button("📝 Draft Alert Email"):
                         if llm:
-                            # 1. Calc Breakdown Strings
+                            # 1. Distribution % Logic
                             m_counts = df_snap[df_snap['week'] == wk_num_snap]['model'].value_counts(normalize=True) * 100
                             d_counts = df_snap[df_snap['week'] == wk_num_snap]['depot_id'].value_counts(normalize=True) * 100
                             
@@ -471,11 +498,13 @@ def main():
                             offenders = wk_p_snap['top_contributors'][:10]
                             off_rows = "\n".join([f"<tr><td>{i['depot_id']}</td><td>{i['svc_no']}</td><td>{i['bus_no']}</td><td>{i['model']}</td><td>{i['driver_id']}</td><td>{i['count']}</td></tr>" for i in offenders])
                             
-                            # 3. Generate
+                            # 3. Generate Email
                             with st.spinner("Drafting..."):
                                 st.session_state.email_draft = llm.predict(PROMPT_ALERT_EMAIL.format(
                                     alarm=alarm, projection=f"{snap_val:.2f}", 
-                                    trend_context="High", breakdown_context=breakdown_text, offender_data=off_rows
+                                    trend_context="High vs 4-wk Avg", 
+                                    breakdown_context=breakdown_text, 
+                                    offender_data=off_rows
                                 ))
                         else: st.error("AI Not Connected")
                     
@@ -483,22 +512,21 @@ def main():
                         if st.button("📨 Send via Power Automate"):
                             try:
                                 res = requests.post(HARDCODED_PA_URL, json={"subject": f"Alert {snap_val:.2f}", "body": st.session_state.email_draft, "recipient": recipients}, timeout=10)
-                                if res.status_code in [200, 202]: st.success("Sent!")
+                                if res.status_code in [200, 202]: st.success("Sent Successfully!")
                                 else: st.error(f"Failed: {res.status_code}")
                             except Exception as e: st.error(f"Error: {e}")
-                else: st.success("Risk Acceptable")
+                else: st.success(f"Risk {snap_val:.2f} is below Critical Threshold (5.0). Escalation inactive.")
             
             with c_email_prev:
                 if "email_draft" in st.session_state and snap_val > 5.0:
                     st.markdown("**Email Preview:**")
                     st.components.v1.html(st.session_state.email_draft, height=400, scrolling=True)
-        else: st.warning("No Data for Date")
+        else: st.warning("No Data found for selected snapshot.")
         st.markdown('</div>', unsafe_allow_html=True)
 
-    # Chatbot
     st.markdown("---")
     st.subheader("💬 Root Cause Analyst")
-    if "chat_log" not in st.session_state: st.session_state.chat_log = [{"role": "assistant", "content": "Ask me about specific weeks or drivers."}]
+    if "chat_log" not in st.session_state: st.session_state.chat_log = [{"role": "assistant", "content": "Ask me about specific weeks or trends."}]
     for m in st.session_state.chat_log: st.chat_message(m["role"]).markdown(m["content"])
     
     if u := st.chat_input("Ask analyst..."):
@@ -507,9 +535,15 @@ def main():
         with st.chat_message("assistant"):
             if llm:
                 with st.spinner("Analyzing..."):
-                    ctx = {"trend": weekly.to_dict('records'), "curr": wk_payload}
-                    sys = f"Analyst. Context: {json.dumps(ctx, cls=NpEncoder)}. Answer user."
+                    ctx = {
+                        "trend": weekly[['year', 'week', 'count', 'per_bc']].to_dict('records'),
+                        "curr": wk_payload,
+                        "4wk": wk4_payload
+                    }
+                    sys = f"Analyst. Context: {json.dumps(ctx, cls=NpEncoder)}. Answer user question."
                     resp = llm.predict(f"{sys}\nQ: {u}")
                     st.markdown(resp); st.session_state.chat_log.append({"role": "assistant", "content": resp})
+            else: st.write("AI Not Connected")
 
-if __name__ == "__main__": main()
+if __name__ == "__main__":
+    main()
