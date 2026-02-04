@@ -19,7 +19,6 @@ load_dotenv()
 # ==========================================
 # 🔧 CONFIGURATION (POWER AUTOMATE LINK)
 # ==========================================
-# Hardcoded link to ensure it works immediately on Azure
 HARDCODED_PA_URL = "https://defaultc88daf55f4aa4f79a143526402ab9a.23.environment.api.powerplatform.com:443/powerautomate/automations/direct/workflows/9c97356356884121962f780d0b6e5e89/triggers/manual/paths/invoke?api-version=1&sp=%2Ftriggers%2Fmanual%2Frun&sv=1.0&sig=SbOZpTqO5gOax1mz06R0dJBVvLt3mN2t2tp3lDGfiv4"
 
 # --- 1. CONFIGURATION HELPER ---
@@ -97,44 +96,39 @@ Your task is to analyze the root cause of the 4-week trend for '{alarm_code}'.
 4. **Summary:** Brief, prioritized next steps.
 """
 
+# --- UPDATED EMAIL PROMPT (SIMPLIFIED) ---
 PROMPT_ALERT_EMAIL = """
-You are drafting a professional operational update email in **HTML format**.
+You are drafting a professional operational alert email in **HTML format**.
 SCENARIO:
 * **Metric:** {alarm}
 * **Projected Value:** {projection}
-* **Trend Context:** {trend_context}
-* **Breakdown Insight:** {breakdown_context}
-* **Top Contributing Factors:** {offender_data}
+* **Top Contributors Data:** {offender_data}
+* **Header Color:** {header_color}
 
 INSTRUCTIONS:
 Return **ONLY** the HTML code.
 Follow this exact structure:
-<h2 style="color: #b91c1c;">Operational Update: {alarm} Metric Status</h2>
+<h2 style="color: {header_color};">Operational Alert: {alarm} Trending to Red Zone</h2>
 <p>
-  <strong>Projected Value:</strong> {projection}<br>
-  <strong>Context:</strong> {trend_context}
+  <strong>Projected value for end of the week:</strong> {projection}
 </p>
-
-<p>{breakdown_context}</p>
-
-<h3 style="color: #b91c1c;">Analysis</h3>
-<p>[Write 2 sentences analyzing the 'Top Contributing Factors'. Explicitly mention if specific models (like EV) are driving the trend. Use neutral language.]</p>
+<p>Below are the key contributors for the alarm count this week:</p>
 
 <h3>Top Contributing Factors</h3>
 <table border="1" cellpadding="5" cellspacing="0" style="border-collapse: collapse; width: 100%;">
   <tr style="background-color: #f2f2f2;"><th>Depot</th><th>Service</th><th>Bus</th><th>Model</th><th>Driver</th><th>Total HA Count</th></tr>
   {offender_data}
 </table>
-<h3 style="color: #b91c1c;">Suggested Actions</h3>
+
+<h3>Action Required</h3>
 <ul>
-  <li>Review root cause of alarm frequency on top services.</li>
-  <li>Engage with the relevant Depot to discuss driver support.</li>
-  <li>Continue monitoring {alarm} metric.</li>
+  <li>Depot Head to engage with driver and monitor.</li>
+  <li>Talk with SIS to check on data issues/sensor issues for the list flagged out.</li>
 </ul>
 <p>Best regards,<br>Data Analytics Team</p>
 """
 
-# --- 4. AI SETUP (Missing Function Fixed Here) ---
+# --- 4. AI SETUP ---
 @st.cache_resource
 def initialize_llm():
     try:
@@ -480,20 +474,20 @@ def main():
             c_email_btn, c_email_prev = st.columns([1, 2])
             
             with c_email_btn:
-                if snap_val > 5.0:
-                    st.error("🚨 Risk Level Critical: Alert Generation Enabled.")
+                # Trigger Yellow (>3.0) and Red (>5.0)
+                if snap_val > 3.0:
+                    is_critical = snap_val > 5.0
+                    header_col = "#b91c1c" if is_critical else "#d97706"
+                    
+                    if is_critical:
+                        st.error("🚨 Critical Risk (>5.0): Alert Generation Enabled.")
+                    else:
+                        st.warning("⚠️ Elevated Risk (>3.0): Alert Generation Enabled.")
+                        
                     recipients = st.text_input("Recipients", "devi02@smrt.com.sg; fleet_ops@smrt.com.sg")
                     
                     if st.button("📝 Draft Alert Email"):
                         if llm:
-                            # 1. Distribution % Logic
-                            m_counts = df_snap[df_snap['week'] == wk_num_snap]['model'].value_counts(normalize=True) * 100
-                            d_counts = df_snap[df_snap['week'] == wk_num_snap]['depot_id'].value_counts(normalize=True) * 100
-                            
-                            model_str = ", ".join([f"{k}: {v:.1f}%" for k, v in m_counts.head(3).items()])
-                            depot_str = ", ".join([f"{k}: {v:.1f}%" for k, v in d_counts.head(3).items()])
-                            breakdown_text = f"<b>Projected Week Model Distribution:</b> {model_str}<br><b>Projected Week Depot Distribution:</b> {depot_str}"
-                            
                             # 2. Top 10 Offenders
                             offenders = wk_p_snap['top_contributors'][:10]
                             off_rows = "\n".join([f"<tr><td>{i['depot_id']}</td><td>{i['svc_no']}</td><td>{i['bus_no']}</td><td>{i['model']}</td><td>{i['driver_id']}</td><td>{i['count']}</td></tr>" for i in offenders])
@@ -502,9 +496,10 @@ def main():
                             with st.spinner("Drafting..."):
                                 st.session_state.email_draft = llm.predict(PROMPT_ALERT_EMAIL.format(
                                     alarm=alarm, projection=f"{snap_val:.2f}", 
-                                    trend_context="High vs 4-wk Avg", 
-                                    breakdown_context=breakdown_text, 
-                                    offender_data=off_rows
+                                    trend_context=f"Risk Level: {'Critical' if is_critical else 'Elevated'}", 
+                                    breakdown_context="", # Removing complex distribution string to keep it simple as per request
+                                    offender_data=off_rows,
+                                    header_color=header_col
                                 ))
                         else: st.error("AI Not Connected")
                     
@@ -515,10 +510,10 @@ def main():
                                 if res.status_code in [200, 202]: st.success("Sent Successfully!")
                                 else: st.error(f"Failed: {res.status_code}")
                             except Exception as e: st.error(f"Error: {e}")
-                else: st.success(f"Risk {snap_val:.2f} is below Critical Threshold (5.0). Escalation inactive.")
+                else: st.success(f"Risk {snap_val:.2f} is Safe (<3.0). Escalation inactive.")
             
             with c_email_prev:
-                if "email_draft" in st.session_state and snap_val > 5.0:
+                if "email_draft" in st.session_state and snap_val > 3.0:
                     st.markdown("**Email Preview:**")
                     st.components.v1.html(st.session_state.email_draft, height=400, scrolling=True)
         else: st.warning("No Data found for selected snapshot.")
@@ -535,10 +530,25 @@ def main():
         with st.chat_message("assistant"):
             if llm:
                 with st.spinner("Analyzing..."):
+                    # FIX: Inject Detailed Historical Breakdown (Bus, Svc, Driver)
+                    recent_weeks = weekly['week'].tail(5).tolist()
+                    hist_data = {}
+                    for w in recent_weeks:
+                        d = df_filtered[df_filtered['week'] == w]
+                        if not d.empty:
+                            hist_data[f"W{w}"] = {
+                                "total": int(len(d)),
+                                "depot": d['depot_id'].value_counts().head(3).to_dict(),
+                                "model": d['model'].value_counts().head(3).to_dict(),
+                                "svc": d['svc_no'].value_counts().head(3).to_dict(),
+                                "driver": d['driver_id'].value_counts().head(3).to_dict(),
+                                "bus": d['bus_no'].value_counts().head(3).to_dict()
+                            }
+
                     ctx = {
                         "trend": weekly[['year', 'week', 'count', 'per_bc']].to_dict('records'),
-                        "curr": wk_payload,
-                        "4wk": wk4_payload
+                        "history_breakdown": hist_data,
+                        "current_deep_dive": wk_payload
                     }
                     sys = f"Analyst. Context: {json.dumps(ctx, cls=NpEncoder)}. Answer user question."
                     resp = llm.predict(f"{sys}\nQ: {u}")
