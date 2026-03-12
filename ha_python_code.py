@@ -1605,19 +1605,19 @@ def build_agent_tools(df_alarm, weekly_sum, total_hc, alarm_choice, df_raw, depo
         Tool(name="model_analysis",       func=tool_model_analysis,
              description="Compare alarm rates by bus model — flags systematic vehicle-type issues. Input: empty string"),
         Tool(name="find_patterns",        func=tool_find_patterns,
-             description="Cross-entity pattern finder: driver+bus combos, driver+service combos, model+depot hotspots, chronic contributors. Input: empty string"),
+             description="USE FOR: repeat/persistent/chronic contributors, buses or drivers appearing across multiple weeks, cross-entity combos (driver+bus, route+model). Input: empty string. DO NOT use spike_analysis for repeat/persistent questions."),
         Tool(name="detect_anomalies",     func=tool_detect_anomalies,
              description="Statistical anomaly detection: 2SD outliers, low-trip high-rate, week-on-week spikes, new entrants to top-10. Input: empty string"),
         Tool(name="weekly_trend",         func=tool_weekly_trend,
              description="Fleet weekly trend with depot breakdown and momentum. Input: number of weeks e.g. '8'"),
         Tool(name="top_contributors",        func=tool_top_contributors,
-             description="Top 15 contributors with depot, model, rate vs fleet. Input: 'driver', 'bus', 'svc', or 'model'"),
+             description="USE FOR: top N drivers/buses/services by alarm count in the current or a specific week. NOT for multi-week repeat/persistent patterns (use find_patterns for that). Input: 'driver', 'bus', 'svc', or 'model'"),
         Tool(name="week_summary",         func=tool_week_summary,
              description="Detailed week summary: depot, model, driver, bus, service, vs prior week. Input: 'W9' or 'W9 2026'"),
         Tool(name="root_cause_drill",     func=tool_root_cause_drill,
              description="Multi-dimension root cause: classifies DRIVER/VEHICLE/ROUTE/FLEET. Input: 'driver 30450', 'bus SMB123D', 'svc 97', 'depot KRANJI'"),
         Tool(name="spike_analysis",       func=tool_spike_analysis,
-             description="Deep week-on-week spike analysis: depot × bus model (EV/diesel) × service route × bus×service combos × new entrants. Use when asked WHY a week went up/down. Input: week e.g. 'W9' or 'W9 2026'"),
+             description="USE FOR: why a specific week went up or down, what caused an increase/decrease. NOT for repeat/persistent/chronic questions. Input: week e.g. 'W9' or 'W9 2026'"),
     ]
 
 # ─────────────────────────────────────────────
@@ -1627,16 +1627,35 @@ REACT_PROMPT_TEMPLATE = """You are a Fleet Operations Analyst for bus telematics
 Alarm: {alarm_choice} | Depots: {depots}
 Thresholds: >5.0/BC=CRITICAL | 3.0-5.0=ELEVATED | <3.0=NORMAL
 
-TOOL SELECTION GUIDE (pick the right tool first time):
-- "why did W9 go up / spike / increase" → USE spike_analysis
-- "compare depots" → USE depot_compare
-- "top drivers/buses" → USE top_contributors
-- "driver <ID>" → USE driver_deep_profile
-- "bus <ID>" → USE bus_deep_profile
-- "W9 summary" → USE week_summary
-- "trend / last 8 weeks" → USE weekly_trend
-- "patterns / combos" → USE find_patterns
-- "BYD / EV model issues" → USE spike_analysis OR model_analysis
+══════════════════════════════════════════════
+CRITICAL: MATCH THE QUESTION TYPE TO THE CORRECT TOOL — DO NOT GUESS
+
+QUESTION TYPE → CORRECT TOOL (read carefully before picking):
+
+| If question asks about...                                        | Use this tool           |
+|------------------------------------------------------------------|-------------------------|
+| WHY a week went up/down / spike / increase / what caused rise    | spike_analysis          |
+| REPEAT / PERSISTENT / CHRONIC buses/drivers over multiple weeks  | find_patterns           |
+| TOP buses/drivers by alarm count THIS week or a specific week    | top_contributors        |
+| A specific driver by ID (e.g. "driver 30450")                    | driver_deep_profile     |
+| A specific bus by number (e.g. "bus SMB123D")                    | bus_deep_profile        |
+| A specific service/route (e.g. "service 75")                     | service_deep_profile    |
+| DEPOT comparison / which depot is worst                          | depot_compare           |
+| BUS MODEL comparison / EV vs diesel / BYD issues                 | model_analysis          |
+| WEEK SUMMARY for a specific week (e.g. "W9 summary")             | week_summary            |
+| TREND over weeks / is fleet improving                            | weekly_trend            |
+| ANOMALIES / statistical outliers / new entrants                  | detect_anomalies        |
+| CROSS COMBOS / same bus+driver+route patterns                    | find_patterns           |
+
+EXAMPLES — use these to calibrate:
+- "Which buses are repeat contributors across the last 4 weeks?" → find_patterns  (NOT spike_analysis)
+- "Which drivers keep appearing week after week?" → find_patterns  (NOT top_contributors)
+- "Why did HA go up in W9?" → spike_analysis  (NOT find_patterns)
+- "Top 10 buses this week" → top_contributors with input "bus"  (NOT find_patterns)
+- "What caused the increase last week?" → spike_analysis
+- "Which bus has the highest alarm rate?" → top_contributors with input "bus"
+- "Are there chronic problem buses?" → find_patterns
+══════════════════════════════════════════════
 
 TOOLS AVAILABLE:
 {tools}
@@ -1646,26 +1665,21 @@ MANDATORY FORMAT RULES — VIOLATION CAUSES FAILURE:
 1. After EVERY Thought you MUST write Action: then Action Input: (no exceptions)
 2. NEVER write Final Answer inside a Thought block
 3. Final Answer must be a standalone line ONLY after an Observation
-4. Use 1 tool for simple questions (depot compare, top list, weekly trend)
-5. Use 2-3 tools max for complex root cause questions
-6. Once you have data from a tool — go straight to Final Answer
+4. Use EXACTLY 1 tool — pick the right one first time
+5. Once you have data from a tool — go straight to Final Answer
+6. Answer ONLY what was asked — do not add unrequested analysis
 ══════════════════════════════════════════════
 
 CORRECT FORMAT — follow exactly:
 
 Question: {input}
-Thought: I will use [tool] to answer this.
+Thought: The question asks about [topic]. Based on the tool selection guide, I should use [tool].
 Action: [tool name — must be exactly one of: {tool_names}]
 Action Input: [input value]
 Observation: [tool result — provided automatically]
-Thought: I now have the data I need to give a complete answer.
+Thought: I now have the data needed to answer the specific question asked.
 Final Answer:
-## [Title]
-[Markdown answer with bold entity IDs, specific numbers, and a priority action table]
-
-| Priority | Action | Target | Evidence |
-|----------|--------|--------|---------|
-| High | ... | ... | ... |
+[Answer focused ONLY on what was asked, with specific numbers and entity IDs in bold]
 
 {agent_scratchpad}"""
 
@@ -1768,10 +1782,61 @@ def smart_rule_analyst(q: str, alarm_choice: str, df_alarm: pd.DataFrame,
             return ans, wk_breakdown
 
     # ── 2. TOP CONTRIBUTORS (drivers / buses / services / all) ──
-    kw_top = any(w in ql for w in ["top", "offend", "highest", "high", "most alarm", "most incident"])
-    kw_driver = any(w in ql for w in ["driver", "bc", "captain", "operator"])
-    kw_bus    = any(w in ql for w in ["bus", "vehicle", "fleet"])
-    kw_svc    = any(w in ql for w in ["service", "route", "svc"])
+    kw_top     = any(w in ql for w in ["top", "offend", "highest", "high", "most alarm",
+                                        "most incident", "contributor", "contributing",
+                                        "repeat", "persistent", "chronic", "worst"])
+    kw_driver  = any(w in ql for w in ["driver", "bc", "captain", "operator"])
+    kw_bus     = any(w in ql for w in ["bus", "vehicle"])
+    kw_svc     = any(w in ql for w in ["service", "route", "svc"])
+    kw_repeat  = any(w in ql for w in ["repeat", "persistent", "chronic", "recurring",
+                                        "again", "consistent", "multiple week", "4 week",
+                                        "four week", "last 4", "last four", "across week"])
+
+    # ── 2a. REPEAT / PERSISTENT contributors (multi-week pattern) ────────
+    # Must be checked BEFORE spike/trend so "repeat buses" doesn't fall through to spike
+    if kw_repeat:
+        # Determine how many weeks to look back (default 4)
+        nwk_m = re.search(r"(\d+)\s*week", ql)
+        n_wks = int(nwk_m.group(1)) if nwk_m else 4
+        n_wks = max(2, min(n_wks, 12))
+
+        recent_weeks = sorted(df["alarm_week"].unique())[-n_wks:]
+        threshold    = max(2, n_wks - 1)   # must appear in at least n-1 of n weeks
+
+        entity_col  = "bus_no" if kw_bus else ("svc_no" if kw_svc else "driver_id")
+        entity_label = "Bus" if kw_bus else ("Service" if kw_svc else "Driver")
+
+        rows = []
+        for eid, grp in df[df["alarm_week"].isin(recent_weeks)].groupby(entity_col):
+            wks_present = grp["alarm_week"].nunique()
+            if wks_present >= threshold:
+                total_alarms = len(grp)
+                rate         = round(total_alarms / max(1, grp["trip_id_norm"].nunique()), 3)
+                depot        = grp["depot_id"].mode()[0] if "depot_id" in grp.columns and not grp.empty else "?"
+                model        = grp["model"].mode()[0] if "model" in grp.columns and not grp.empty else ""
+                wk_counts    = grp.groupby("alarm_week").size().to_dict()
+                rows.append({entity_label: str(eid), "Weeks Active": wks_present,
+                             "Total Alarms": total_alarms, "Avg Rate": rate,
+                             "Depot": depot, "Model": model,
+                             "Week Breakdown": " | ".join(f"W{int(w)}:{c}" for w, c in sorted(wk_counts.items()))})
+
+        if rows:
+            tbl = (pd.DataFrame(rows)
+                   .sort_values(["Weeks Active", "Total Alarms"], ascending=[False, False])
+                   .head(top_n))
+            display_cols = [entity_label, "Weeks Active", "Total Alarms", "Avg Rate", "Depot"]
+            if kw_bus and "Model" in tbl.columns and tbl["Model"].str.len().gt(0).any():
+                display_cols.insert(3, "Model")
+            ans = (f"## Repeat {entity_label}s — {alarm_choice} (Last {n_wks} weeks)\n\n"
+                   f"**{len(rows)} {entity_label.lower()}(s) appeared in {threshold}+ of the last {n_wks} weeks.**\n\n"
+                   f"*These are persistent contributors — not just one bad week.*\n\n"
+                   f"*Ask `bus <ID>` for a full profile of any bus below.*")
+            return ans, tbl[display_cols]
+        else:
+            return (f"## Repeat {entity_label}s — {alarm_choice}\n\n"
+                    f"No {entity_label.lower()}(s) appeared in {threshold}+ of the last {n_wks} weeks. "
+                    f"Contributions are spread across different {entity_label.lower()}s each week — no persistent pattern detected.",
+                    pd.DataFrame())
 
     if kw_top or "ranking" in ql or "list" in ql:
         results = []
