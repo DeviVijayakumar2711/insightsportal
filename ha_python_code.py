@@ -493,15 +493,29 @@ def calc_metrics(ev_df, trips_df, category):
 # ─────────────────────────────────────────────
 # SMART FORECAST
 # ─────────────────────────────────────────────
-def calculate_smart_forecast(df_filtered, weekly_sum, current_week, total_hc):
+def calculate_smart_forecast(df_filtered, weekly_sum, current_week, total_hc, df_raw_week=None):
+    """
+    df_filtered : already filtered df (may have only_completed=True applied).
+    df_raw_week : optional — unfiltered slice for current_week only, so a week
+                  that is complete in reality but not yet flagged in the data
+                  still produces a valid projection instead of 0.00.
+    """
     if df_filtered.empty or weekly_sum.empty:
         return 0.0, pd.DataFrame(), {}
-    curr_data = df_filtered[df_filtered["alarm_week"] == current_week]
+
+    # For the current week use df_raw_week if provided (bypasses completed-flag filter)
+    curr_data = (df_raw_week if df_raw_week is not None and not df_raw_week.empty
+                 else df_filtered[df_filtered["alarm_week"] == current_week])
+
     if not curr_data.empty and "day_of_week" in curr_data.columns:
         max_day_idx = int(curr_data["day_of_week"].max())
         day_name    = curr_data["alarm_date"].max().strftime('%A') if curr_data["alarm_date"].notna().any() else "Friday"
     else:
         max_day_idx = 4; day_name = "Friday"
+
+    # If week is fully complete (Sunday = day 6), use actual count directly
+    week_fully_complete = (max_day_idx >= 6)
+
     past_weeks = weekly_sum[weekly_sum["alarm_week"] < current_week]["alarm_week"].unique()[-12:]
     ratios = []
     for w in past_weeks:
@@ -510,30 +524,43 @@ def calculate_smart_forecast(df_filtered, weekly_sum, current_week, total_hc):
             ratios.append(len(wd[wd["day_of_week"] <= max_day_idx]) / len(wd))
     comp_rate = float(np.mean(ratios)) if ratios else (max_day_idx + 1) / 7.0
     comp_rate = max(0.05, comp_rate)
+
     momentum = 1.0
     if len(weekly_sum) >= 5:
         rates = weekly_sum[weekly_sum["alarm_week"] < current_week].tail(4)["per_bc"].values
         if len(rates) > 1:
             s, _ = np.polyfit(np.arange(len(rates)), rates, 1)
             if s > 0: momentum = 1 + (s * 0.5)
+
     display_weeks = weekly_sum["alarm_week"].unique()[-5:]
+    hc = max(1, total_hc)
     comp_rows = []
     for w in display_weeks:
         is_curr  = (w == current_week)
         wk_slice = df_filtered[df_filtered["alarm_week"] == w]
-        hc       = max(1, total_hc)
         if is_curr:
-            count_so_far = (len(wk_slice[wk_slice["day_of_week"] <= max_day_idx])
-                            if "day_of_week" in wk_slice.columns else len(wk_slice))
-            raw    = count_so_far / comp_rate
-            adj    = raw * momentum
-            avg_4  = weekly_sum[weekly_sum["alarm_week"] < w].tail(4)["per_bc"].mean()
-            if pd.isna(avg_4): avg_4 = count_so_far / hc
-            w_prof = min(1.0, comp_rate + 0.15)
-            final  = ((adj / hc) * w_prof) + (avg_4 * (1 - w_prof))
-            comp_rows.append({"week_label": f"W{int(w)} (Fcst)", "status": "In Progress", "display_rate": float(final)})
+            curr_count = len(curr_data)  # use unfiltered current week count
+            if week_fully_complete:
+                # Week is done — use actual rate directly, no projection needed
+                final = curr_count / hc
+                label = f"W{int(w)}"
+                status = "Completed"
+            else:
+                count_so_far = (len(curr_data[curr_data["day_of_week"] <= max_day_idx])
+                                if "day_of_week" in curr_data.columns else curr_count)
+                raw   = count_so_far / comp_rate
+                adj   = raw * momentum
+                avg_4 = weekly_sum[weekly_sum["alarm_week"] < w].tail(4)["per_bc"].mean()
+                if pd.isna(avg_4): avg_4 = count_so_far / hc
+                w_prof = min(1.0, comp_rate + 0.15)
+                final  = ((adj / hc) * w_prof) + (avg_4 * (1 - w_prof))
+                label  = f"W{int(w)} (Fcst)"
+                status = "In Progress"
+            comp_rows.append({"week_label": label, "status": status, "display_rate": float(final)})
         else:
-            comp_rows.append({"week_label": f"W{int(w)}", "status": "Completed", "display_rate": float(len(wk_slice) / hc)})
+            actual = len(wk_slice) / hc if not wk_slice.empty else 0.0
+            comp_rows.append({"week_label": f"W{int(w)}", "status": "Completed", "display_rate": float(actual)})
+
     proj_val = comp_rows[-1]["display_rate"] if comp_rows else 0.0
     return proj_val, pd.DataFrame(comp_rows), {"day": day_name, "completion_rate": comp_rate}
 
@@ -651,7 +678,7 @@ def driver_trend_bar(df_alarm, weeks_list):
     d4_top  = d4[d4["driver_id"].isin(top_drv)]
     pivot   = d4_top.groupby(["driver_id","alarm_week"]).size().reset_index(name="count")
     fig = px.bar(pivot, x="driver_id", y="count", color=pivot["alarm_week"].astype(str),
-                 barmode="group", title="Top 15 Drivers — 4-Week Alarm Count",
+                 barmode="group", title="Top 15 Contributing Drivers — 4-Week Alarm Count",
                  labels={"driver_id":"Driver","count":"Alarms","color":"Week"})
     fig.update_layout(xaxis=dict(tickangle=-45, **AXIS_STYLE),
                       yaxis=dict(**AXIS_STYLE), **PLOTLY_THEME,
@@ -734,7 +761,7 @@ def build_agent_tools(df_alarm, weekly_sum, total_hc, alarm_choice, df_raw, depo
         n_buses = len(bus_stats)
         high_rate_buses = bus_stats[bus_stats["rate"] > _fleet_rate]
         if n_buses >= 3 and len(high_rate_buses) >= 2:
-            signal = "⚠️ DRIVER-SPECIFIC — high rate across multiple buses → coaching/retraining indicated"
+            signal = "⚠️ DRIVER-SPECIFIC — high rate across multiple buses → monitoring and advisory review recommended"
         elif n_buses == 1:
             signal = "🔍 POSSIBLE VEHICLE INTERACTION — single bus, check sensor calibration first"
         else:
@@ -751,14 +778,14 @@ def build_agent_tools(df_alarm, weekly_sum, total_hc, alarm_choice, df_raw, depo
             "**Buses driven (rate per bus):**",
         ]
         for _, row in bus_stats.head(6).iterrows():
-            flag = " ← HIGH" if row["rate"] > _fleet_rate * 1.5 else ""
+            flag = " ← MONITOR" if row["rate"] > _fleet_rate * 1.5 else ""
             lines.append(f"  • {row['bus_no']}: {row['alarms']} alarms / {row['trips']} trips = **{row['rate']:.3f}/trip**{flag}")
         lines += [
             model_str,
             f"\n**Services operated:** {svc_counts}",
             f"\n**Weekly alarm counts:** {wk_breakdown}",
             f"\n**Root Cause Signal:** {signal}",
-            f"\n**Recommended action:** {'Schedule driver coaching session with supervisor' if 'DRIVER-SPECIFIC' in signal else 'Inspect bus sensor + review driver+bus assignment history'}",
+            f"\n**Recommended action:** {'Schedule driver advisory session with depot supervisor' if 'DRIVER-SPECIFIC' in signal else 'Inspect bus sensor + review driver+bus assignment history'}",
         ]
         return "\n".join(lines)
 
@@ -827,7 +854,7 @@ def build_agent_tools(df_alarm, weekly_sum, total_hc, alarm_choice, df_raw, depo
             "**Drivers operating this bus (rate per driver):**",
         ]
         for _, row in drv_stats.head(6).iterrows():
-            flag = " ← HIGH" if row["rate"] > cohort_rate * 1.5 else ""
+            flag = " ← MONITOR" if row["rate"] > cohort_rate * 1.5 else ""
             lines.append(f"  • Driver {row['driver_id']}: {row['alarms']} alarms / {row['trips']} trips = **{row['rate']:.3f}/trip**{flag}")
         lines += [
             f"\n**Services:** {svc_top}",
@@ -867,7 +894,7 @@ def build_agent_tools(df_alarm, weekly_sum, total_hc, alarm_choice, df_raw, depo
 
         if concentration > 60 and len(high_rate_d) <= 2:
             signal = f"⚠️ DRIVER-CONCENTRATED — top 3 drivers account for {concentration:.0f}% of alarms on this route"
-            action = "Target top 2-3 drivers on this service for coaching; route itself may be fine"
+            action = "Target top 2-3 drivers on this service for advisory support; route itself may be fine"
         elif n_drivers >= 5 and len(high_rate_d) >= 3:
             signal = "⚠️ ROUTE-SPECIFIC — multiple drivers trigger alarms → road conditions, stop layout, or speed profile"
             action = "Review route speed limits, bus stop approach zones; consider route safety audit"
@@ -890,7 +917,7 @@ def build_agent_tools(df_alarm, weekly_sum, total_hc, alarm_choice, df_raw, depo
             "**Drivers on this service:**",
         ]
         for _, row in drv_stats.head(8).iterrows():
-            flag = " ← FLAG" if row["rate"] > _fleet_rate * 1.5 else ""
+            flag = " ← REVIEW" if row["rate"] > _fleet_rate * 1.5 else ""
             lines.append(f"  • Driver {row['driver_id']}: {row['alarms']} alarms / {row['trips']} trips = **{row['rate']:.3f}/trip**{flag}")
         lines += [
             f"\n**Top buses on route:** {bus_top}",
@@ -905,7 +932,7 @@ def build_agent_tools(df_alarm, weekly_sum, total_hc, alarm_choice, df_raw, depo
     # TOOL 4 — Depot deep profile
     # ────────────────────────────────────────────────────────────────────
     def tool_depot_compare(input_str: str = "") -> str:
-        """Compare all depots: rate, trend direction, top offenders per depot, model mix."""
+        """Compare all depots: rate, trend direction, top contributing drivers/buses per depot, model mix."""
         if df_alarm.empty or not _has_depot: return "No depot data available."
         results = []
         for depot in sorted(df_alarm["depot_id"].unique()):
@@ -1034,7 +1061,7 @@ def build_agent_tools(df_alarm, weekly_sum, total_hc, alarm_choice, df_raw, depo
                     lines.append(f"  • Model **{r['model']}** at **{r['depot_id']}**: "
                                  f"{r['alarms']} alarms / {r['trips']} trips = **{r['rate']:.3f}/trip**")
 
-        # 4. Persistent offenders across weeks
+        # 4. Persistent contributors across weeks
         weeks = sorted(df_alarm["alarm_week"].unique())
         if len(weeks) >= 3:
             threshold = max(2, len(weeks) * 0.6)
@@ -1047,7 +1074,7 @@ def build_agent_tools(df_alarm, weekly_sum, total_hc, alarm_choice, df_raw, depo
                     drv_rate = _safe_rate(
                         len(df_alarm[df_alarm["driver_id"]==drv]),
                         df_alarm[df_alarm["driver_id"]==drv]["trip_id_norm"].nunique())
-                    lines.append(f"  • Driver **{drv}**: {wk_count}/{len(weeks)} weeks | rate {drv_rate:.3f}/trip → PRIORITY FOR ACTION")
+                    lines.append(f"  • Driver **{drv}**: {wk_count}/{len(weeks)} weeks | rate {drv_rate:.3f}/trip → RECOMMEND MONITORING")
 
         return "\n".join(lines)
 
@@ -1160,10 +1187,10 @@ def build_agent_tools(df_alarm, weekly_sum, total_hc, alarm_choice, df_raw, depo
         return "\n".join(lines)
 
     # ────────────────────────────────────────────────────────────────────
-    # TOOL 9 — Top offenders with full context
+    # TOOL 9 — Top contributing drivers/buses with full context
     # ────────────────────────────────────────────────────────────────────
-    def tool_top_offenders(category: str = "driver") -> str:
-        """Ranked top offenders with depot, model, rate vs fleet, trend direction."""
+    def tool_top_contributors(category: str = "driver") -> str:
+        """Ranked top contributing drivers/buses with depot, model, rate vs fleet, trend direction."""
         cat_map = {"driver":"driver_id","bus":"bus_no","svc":"svc_no","service":"svc_no","model":"model"}
         col = cat_map.get(category.lower().strip(), "driver_id")
         if col not in df_alarm.columns: return f"Column '{col}' not in data."
@@ -1277,7 +1304,7 @@ def build_agent_tools(df_alarm, weekly_sum, total_hc, alarm_choice, df_raw, depo
             # Verdict
             if n_buses_high >= 2 and n_svc_high >= 2:
                 verdict = "🔴 DRIVER-SPECIFIC — high rate across multiple buses AND services → behaviour issue"
-                action  = "Priority coaching session; if rate >5 consider temporary service reallocation"
+                action  = "Monitor closely and schedule advisory session; if rate >5 consider temporary service reallocation"
             elif n_buses_high == 1:
                 top_bus = bus_rates.sort_values("rate",ascending=False).iloc[0]
                 verdict = f"🟡 DRIVER+VEHICLE INTERACTION — mainly on bus {top_bus['bus_no']} ({top_bus['rate']:.2f}/trip)"
@@ -1314,7 +1341,7 @@ def build_agent_tools(df_alarm, weekly_sum, total_hc, alarm_choice, df_raw, depo
                 action   = f"Profile driver {only_drv} first; don't raise vehicle inspection until driver ruled out"
             else:
                 verdict = "🟠 MIXED — some drivers trigger more alarms than others on this bus"
-                action  = "Review which driver+bus assignments to reassign; highest-rate driver needs coaching"
+                action  = "Review which driver+bus assignments to reassign; highest-rate driver needs advisory support"
 
             lines += [
                 f"**Model:** {model} | **Model cohort avg:** {cohort_rate:.3f}/trip | **vs cohort:** {vs_cohort:+.3f}",
@@ -1330,7 +1357,7 @@ def build_agent_tools(df_alarm, weekly_sum, total_hc, alarm_choice, df_raw, depo
             n_drivers = len(drv_rates)
             if top3_pct > 70 and n_drivers > 5:
                 verdict = f"🔴 DRIVER-CONCENTRATED — top 3 drivers = {top3_pct:.0f}% of alarms on this route"
-                action  = "Coach top 3 drivers; route itself unlikely to be the issue"
+                action  = "Monitor and advise top 3 drivers; route itself unlikely to be the issue"
             elif n_drivers >= 5:
                 verdict = f"🟠 ROUTE-WIDE — {n_drivers} drivers all showing elevated alarms → route/road profile"
                 action  = "Request route safety audit; check stop approach speeds and junctions"
@@ -1370,17 +1397,17 @@ def build_agent_tools(df_alarm, weekly_sum, total_hc, alarm_choice, df_raw, depo
         Tool(name="service_deep_profile", func=tool_service_deep_profile,
              description="Service/route profile: driver concentration, depot, route vs driver issue. Input: service number e.g. '97'"),
         Tool(name="depot_compare",        func=tool_depot_compare,
-             description="Compare all depots: rate, trend, top offenders, model mix. Input: empty string"),
+             description="Compare all depots: rate, trend, top contributing drivers/buses, model mix. Input: empty string"),
         Tool(name="model_analysis",       func=tool_model_analysis,
              description="Compare alarm rates by bus model — flags systematic vehicle-type issues. Input: empty string"),
         Tool(name="find_patterns",        func=tool_find_patterns,
-             description="Cross-entity pattern finder: driver+bus combos, driver+service combos, model+depot hotspots, chronic offenders. Input: empty string"),
+             description="Cross-entity pattern finder: driver+bus combos, driver+service combos, model+depot hotspots, chronic contributors. Input: empty string"),
         Tool(name="detect_anomalies",     func=tool_detect_anomalies,
              description="Statistical anomaly detection: 2SD outliers, low-trip high-rate, week-on-week spikes, new entrants to top-10. Input: empty string"),
         Tool(name="weekly_trend",         func=tool_weekly_trend,
              description="Fleet weekly trend with depot breakdown and momentum. Input: number of weeks e.g. '8'"),
-        Tool(name="top_offenders",        func=tool_top_offenders,
-             description="Top 15 offenders with depot, model, rate vs fleet. Input: 'driver', 'bus', 'svc', or 'model'"),
+        Tool(name="top_contributors",        func=tool_top_contributors,
+             description="Top 15 contributors with depot, model, rate vs fleet. Input: 'driver', 'bus', 'svc', or 'model'"),
         Tool(name="week_summary",         func=tool_week_summary,
              description="Detailed week summary: depot, model, driver, bus, service, vs prior week. Input: 'W9' or 'W9 2026'"),
         Tool(name="root_cause_drill",     func=tool_root_cause_drill,
@@ -1458,7 +1485,7 @@ def smart_rule_analyst(q: str, alarm_choice: str, df_alarm: pd.DataFrame,
     """
     Smart rule-based analyst that handles natural language questions
     without requiring an LLM. Returns (answer_markdown, optional_dataframe).
-    Handles: top offenders, depot compare, week summary, spike analysis,
+    Handles: top contributing drivers/buses, depot compare, week summary, spike analysis,
              trend, specific driver/bus/service lookup, and more.
     """
     if df_alarm is None or df_alarm.empty:
@@ -1523,8 +1550,8 @@ def smart_rule_analyst(q: str, alarm_choice: str, df_alarm: pd.DataFrame,
                    f"**Weekly breakdown:**")
             return ans, wk_breakdown
 
-    # ── 2. TOP OFFENDERS (drivers / buses / services / all) ──
-    kw_top = any(w in ql for w in ["top", "offend", "worst", "high", "most alarm", "most incident"])
+    # ── 2. TOP CONTRIBUTORS (drivers / buses / services / all) ──
+    kw_top = any(w in ql for w in ["top", "offend", "highest", "high", "most alarm", "most incident"])
     kw_driver = any(w in ql for w in ["driver", "bc", "captain", "operator"])
     kw_bus    = any(w in ql for w in ["bus", "vehicle", "fleet"])
     kw_svc    = any(w in ql for w in ["service", "route", "svc"])
@@ -1567,7 +1594,7 @@ def smart_rule_analyst(q: str, alarm_choice: str, df_alarm: pd.DataFrame,
                    f"Top {top_n} account for **{top_total:,} alarms ({pct}%)**\n\n"
                    f"*Tip: Ask `driver <ID>` for a full profile of any driver below.*")
             return ans, tbl
-        return f"No offender data available for {week_label}.", pd.DataFrame()
+        return f"No contributor data available for {week_label}.", pd.DataFrame()
 
     # ── 3. DEPOT COMPARISON ──────────────────────────
     if any(w in ql for w in ["depot", "compare depot", "depot comparison", "by depot"]):
@@ -1582,9 +1609,9 @@ def smart_rule_analyst(q: str, alarm_choice: str, df_alarm: pd.DataFrame,
                    .rename(columns={"depot_id":"Depot"})
                    .sort_values("Alarms", ascending=False))
         best  = dep_tbl.iloc[-1]["Depot"]
-        worst = dep_tbl.iloc[0]["Depot"]
+        highest = dep_tbl.iloc[0]["Depot"]
         ans = (f"## Depot Comparison — {alarm_choice} ({week_label})\n\n"
-               f"- **Highest alarms:** {worst} ({dep_tbl.iloc[0]['Alarms']:,} alarms)\n"
+               f"- **Highest alarms:** {highest} ({dep_tbl.iloc[0]['Alarms']:,} alarms)\n"
                f"- **Lowest alarms:** {best} ({dep_tbl.iloc[-1]['Alarms']:,} alarms)\n\n"
                f"**Full breakdown:**")
         return ans, dep_tbl
@@ -1691,7 +1718,7 @@ def smart_rule_analyst(q: str, alarm_choice: str, df_alarm: pd.DataFrame,
            f"I can answer questions about **{alarm_choice}** data. Try:\n\n"
            f"| Question Type | Example |\n"
            f"|---------------|--------|\n"
-           f"| Top offenders | `top 10 drivers` |\n"
+           f"| Top contributing drivers/buses | `top 10 drivers` |\n"
            f"| Top buses | `top 5 buses` |\n"
            f"| Driver profile | `driver {sample_drivers[0] if sample_drivers else '30450'}` |\n"
            f"| Bus profile | `bus {sample_buses[0] if sample_buses else 'SBS123'}` |\n"
@@ -1747,7 +1774,7 @@ Write 3-4 sentences: total alarms this week, fleet rate vs threshold, which depo
 ### Nexus of Risk
 Identify any cross-category patterns: same driver appearing on same high-alarm bus, or same service + same driver combination. If found, flag as compounding risk factor.
 
-### Low Workload High Rate Offenders
+### Low Workload High Rate Contributors
 List any entities with fewer than 3 trips but above-average alarm rate. These are statistical outliers requiring validation.
 
 ## Recommended Actions
@@ -1757,7 +1784,7 @@ List any entities with fewer than 3 trips but above-average alarm rate. These ar
 | Medium   | [Driver/Bus/Depot] | [Specific action] | [Specific numbers] |
 | Low      | [Driver/Bus/Depot] | [Specific action] | [Specific numbers] |
 
-Use actions like: "Schedule coaching session", "Inspect sensor calibration", "Review route assignment", "Monitor closely next week", "Engage depot head".
+Use actions like: "Schedule advisory session", "Inspect sensor calibration", "Review route assignment", "Monitor closely next week", "Engage depot head".
 """.strip())
     except Exception as e:
         return f"AI error: {e}"
@@ -1818,15 +1845,15 @@ PATTERN DATA:
 - Alarm: {alarm_code} ({alarm_name})
 - 4-week average rate: {avg_4wk:.3f} per BC | Overall trend: {trend_direction}
 - Weekly rates: {weeks_json}
-- Drivers appearing in 3+ of last 4 weeks (persistent offenders): {repeating_drivers_json}
-- Buses appearing in 3+ of last 4 weeks (persistent offenders): {repeating_buses_json}
+- Drivers appearing in 3+ of last 4 weeks (persistent contributors): {repeating_drivers_json}
+- Buses appearing in 3+ of last 4 weeks (persistent contributors): {repeating_buses_json}
 
 Write a structured pattern analysis:
 
 **4-Week Trend Summary**
 2 sentences: Is the fleet improving, worsening, or cycling? Quote the range from lowest to highest week rate.
 
-**Persistent Offenders**
+**Persistent Contributors**
 - Top repeat driver(s) with total alarm count across the 4 weeks
 - Top repeat bus(es) with total alarm count — note if same bus/driver keep appearing together
 
@@ -1834,7 +1861,7 @@ Write a structured pattern analysis:
 State whether this looks like: SYSTEMIC FLEET ISSUE / DEPOT-SPECIFIC PATTERN / INDIVIDUAL OUTLIER(S) / MIXED
 
 **Recommended Action**
-One targeted action for the most persistent offender, with specific data rationale.
+One targeted action for the most persistent contributor, with specific data rationale.
 
 Keep under 130 words. Use bold for entity IDs and numbers.
 """.strip())
@@ -2040,6 +2067,14 @@ def main():
     df_alarm, week_map, weekly = slice_by_filters(
         df_raw, weekly_all, depots_tuple, alarm_choice, only_completed, exclude_null)
     weekly_sum, total_hc = per_week_kpis(weekly, headcounts, depots_tuple)
+
+    # ── Raw current-week slice (ignores completed flag — used by forecast) ──
+    # This ensures forecast never shows 0.00 when week is done but flag not set yet
+    df_raw_week_slice = df_raw[
+        (df_raw["alarm_up"] == alarm_choice) &
+        (df_raw["depot_id"].isin(set(depots_tuple))) &
+        (df_raw["alarm_date"].notna())
+    ] if not df_raw.empty else pd.DataFrame()
 
     # ── Agent ────────────────────────────────
     agent_tools = build_agent_tools(df_alarm, weekly_sum, total_hc, alarm_choice, df_raw, depots_tuple)
@@ -2419,7 +2454,7 @@ def main():
                 insight_text4 = (
                     f"4-week baseline: <b>{avg_4wk:.3f}</b> alarms per bus-change. Trend is <b>{trend_dir}</b>. "
                     f"Weekly rates — {weeks_summary}. "
-                    f"<i>Connect Azure OpenAI for repeating-offender analysis.</i>"
+                    f"<i>Connect Azure OpenAI for repeating-contributor analysis.</i>"
                 )
                 box_style4 = "background:#f8fafc;border-left:4px solid #94a3b8;"
                 lbl_style4 = "color:#475569;"
@@ -2480,7 +2515,7 @@ def main():
 DATA (last 4 weeks): {json.dumps(context_data, default=float)}
 
 ## 📈 Trend Overview
-## 🔍 Persistent Offenders (Drivers, Buses, Services)
+## 🔍 Persistent Contributors (Drivers, Buses, Services)
 ## 🔗 Operational Nexus
 ## 📊 Depot Analysis
 ## ✅ Priority Action Plan (table with Priority, Target, Action, Evidence)
@@ -2507,7 +2542,8 @@ Use specific IDs and counts. Be direct and operational.""".strip())
 
         with st3a:
             if not df_alarm.empty and not weekly_sum.empty:
-                proj_val, comp_df, explainer = calculate_smart_forecast(df_alarm, weekly_sum, w1_week, total_hc)
+                proj_val, comp_df, explainer = calculate_smart_forecast(df_alarm, weekly_sum, w1_week, total_hc,
+                    df_raw_week=df_raw_week_slice[df_raw_week_slice["alarm_week"]==w1_week] if not df_raw_week_slice.empty else None)
                 f1, f2, f3 = st.columns(3)
                 f1.metric("Projected End-of-Week Rate", f"{proj_val:.2f}", delta_color="inverse")
                 f2.metric("Data Through",               explainer.get("day","N/A"))
@@ -2560,7 +2596,8 @@ Use specific IDs and counts. Be direct and operational.""".strip())
 
         with st3b:
             if not df_alarm.empty and not weekly_sum.empty:
-                proj_val2, comp_df2, _ = calculate_smart_forecast(df_alarm, weekly_sum, w1_week, total_hc)
+                proj_val2, comp_df2, _ = calculate_smart_forecast(df_alarm, weekly_sum, w1_week, total_hc,
+                    df_raw_week=df_raw_week_slice[df_raw_week_slice["alarm_week"]==w1_week] if not df_raw_week_slice.empty else None)
                 fig_fc = forecast_bar_chart(comp_df2)
                 st.plotly_chart(fig_fc, use_container_width=True)
                 if llm:
@@ -2580,7 +2617,8 @@ Use specific IDs and counts. Be direct and operational.""".strip())
                             d = df_alarm[df_alarm["depot_id"]==dep]
                             if not d.empty:
                                 depot_stats[dep] = int(len(d[d["alarm_week"]==w1_week]))
-                        proj_v, _, _ = calculate_smart_forecast(df_alarm, weekly_sum, w1_week, total_hc)
+                        proj_v, _, _ = calculate_smart_forecast(df_alarm, weekly_sum, w1_week, total_hc,
+                            df_raw_week=df_raw_week_slice[df_raw_week_slice["alarm_week"]==w1_week] if not df_raw_week_slice.empty else None)
                         try:
                             brief = llm.predict(f"""You are Head of Fleet Operations. Write a high-level Executive Briefing.
 Alarm: {alarm_choice} | 12-Week Trend: {trend_vals} | Latest Rate: {w1_metric:.2f} | Projected: {proj_v:.2f}
@@ -2735,7 +2773,7 @@ Rules: state CRITICAL/ELEVATED/NORMAL, mention trend direction, identify primary
 
 <h3 style="color:{h_color};">Action Required</h3>
 <ul>
-  <li>Depot Head to engage with driver and monitor for the week.</li>
+  <li>Depot Head to monitor and advise driver and monitor for the week.</li>
   <li>Talk with SIS to check on data / sensor issues for the list flagged out.</li>
 </ul>
 <p>Best regards,<br/>Data Analytics Team</p>"""
@@ -2837,7 +2875,7 @@ Rules: state CRITICAL/ELEVATED/NORMAL, mention trend direction, identify primary
                 }
         ctx["per_week_detail"] = per_week
 
-        # Overall top offenders (all data loaded)
+        # Overall top contributing drivers/buses (all data loaded)
         ctx["all_time_top_drivers"]  = df_alarm["driver_id"].value_counts().head(15).to_dict()
         ctx["all_time_top_buses"]    = df_alarm["bus_no"].value_counts().head(15).to_dict()
         ctx["all_time_top_services"] = df_alarm["svc_no"].value_counts().head(10).to_dict()
@@ -2874,7 +2912,7 @@ Rules: state CRITICAL/ELEVATED/NORMAL, mention trend direction, identify primary
                 ctx["model_rates"] = mr.sort_values("rate", ascending=False).set_index("model")[["a","t","rate"]].rename(columns={"a":"alarms","t":"trips"}).to_dict("index")
             except Exception: pass
 
-        # Chronic offenders (present 3+ weeks)
+        # Chronic contributors (present 3+ weeks)
         try:
             weeks_available = df_alarm["alarm_week"].nunique()
             threshold = max(2, weeks_available * 0.5)
@@ -2912,14 +2950,14 @@ Thresholds: >5.0 alarms/BC = CRITICAL (red) | 3.0–5.0 = ELEVATED (amber) | <3.
 BC = Bus Change (shift/trip unit). Fleet average this period: {fleet_rate:.3f}/BC
 
 Root cause decision tree:
-- High rate across 3+ buses → DRIVER-SPECIFIC → coaching
+- High rate across 3+ buses → DRIVER-SPECIFIC → advisory support
 - High rate across 3+ drivers → VEHICLE-SPECIFIC → sensor/maintenance inspection  
 - High rate on 1 service with many drivers → ROUTE-SPECIFIC → route audit
 - High rate fleet-wide with no single driver/bus pattern → FLEET-WIDE → training programme
 - High rate on <5 trips → INSUFFICIENT DATA → monitor 2 more weeks before action
 
 Anomaly flags:
-- Chronic offender: driver/bus present in top-10 for 3+ consecutive weeks
+- Chronic contributor: driver/bus present in top-10 for 3+ consecutive weeks
 - New entrant spike: entity not in top-10 last week, suddenly top-5 this week
 - Low-trip outlier: ≤5 trips but rate >2× fleet avg (statistically unreliable)
 - Model systematic: entire bus model above fleet avg → fleet-wide maintenance issue
@@ -2992,8 +3030,8 @@ Be direct, specific, and operational — no generic observations.
     SUGGESTED_QS = [
         f"Why did {alarm_choice} spike in W{w1_week}?",
         "Who are the top 10 drivers this week and which depot are they from?",
-        "Which buses are repeat offenders across the last 4 weeks?",
-        "Compare depot performance — which has the worst rate?",
+        "Which buses are repeat contributors across the last 4 weeks?",
+        "Compare depot performance — which has the highest rate?",
         f"What is the root cause for the highest offending driver?",
         "Is the fleet trend improving or worsening? Predict next week.",
         "Which service routes have the most alarms and why?",
