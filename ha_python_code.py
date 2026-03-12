@@ -1753,6 +1753,11 @@ def smart_rule_analyst(q: str, alarm_choice: str, df_alarm: pd.DataFrame,
             df_q = df_q[df_q["alarm_year"] == filter_yr]
     week_label = f"W{filter_wk}" + (f" {filter_yr}" if filter_yr else "") if filter_wk else "current selection"
 
+    # Pre-classify spike/trend intent — used to prevent week_summary from stealing spike questions
+    _spike_kws = ["spike","jump","surge","increase","why","root cause","cause",
+                  "went up","gone up","higher","increased","trend","improving","worsening","forecast"]
+    has_spike_q = any(w in ql for w in _spike_kws)
+
     # ── 1. SPECIFIC ENTITY LOOKUP ────────────────────
     for pat, col, label in [
         (r"(?:driver|bc|captain)\s*#?\s*([a-z0-9._-]+)", "driver_id", "Driver"),
@@ -1790,7 +1795,9 @@ def smart_rule_analyst(q: str, alarm_choice: str, df_alarm: pd.DataFrame,
     kw_svc     = any(w in ql for w in ["service", "route", "svc"])
     kw_repeat  = any(w in ql for w in ["repeat", "persistent", "chronic", "recurring",
                                         "again", "consistent", "multiple week", "4 week",
-                                        "four week", "last 4", "last four", "across week"])
+                                        "four week", "last 4", "last four", "across week",
+                                        "keep appear", "keep showing", "reappear",
+                                        "every week", "week after week", "keeps coming"])
 
     # ── 2a. REPEAT / PERSISTENT contributors (multi-week pattern) ────────
     # Must be checked BEFORE spike/trend so "repeat buses" doesn't fall through to spike
@@ -1838,7 +1845,9 @@ def smart_rule_analyst(q: str, alarm_choice: str, df_alarm: pd.DataFrame,
                     f"Contributions are spread across different {entity_label.lower()}s each week — no persistent pattern detected.",
                     pd.DataFrame())
 
-    if kw_top or "ranking" in ql or "list" in ql:
+    # Skip kw_top if this is really a depot question
+    _is_depot_q = any(w in ql for w in ["depot", "which depot", "worst depot", "best depot"])
+    if (kw_top or "ranking" in ql or "list" in ql) and not _is_depot_q:
         results = []
         dset = df_q if not df_q.empty else df
 
@@ -1879,7 +1888,8 @@ def smart_rule_analyst(q: str, alarm_choice: str, df_alarm: pd.DataFrame,
         return f"No contributor data available for {week_label}.", pd.DataFrame()
 
     # ── 3. DEPOT COMPARISON ──────────────────────────
-    if any(w in ql for w in ["depot", "compare depot", "depot comparison", "by depot"]):
+    if any(w in ql for w in ["depot", "compare depot", "depot comparison", "by depot",
+                               "which depot", "worst depot", "best depot"]):
         dset = df_q if not df_q.empty else df
         if "depot_id" not in dset.columns:
             return "No depot data in dataset.", pd.DataFrame()
@@ -1899,7 +1909,7 @@ def smart_rule_analyst(q: str, alarm_choice: str, df_alarm: pd.DataFrame,
         return ans, dep_tbl
 
     # ── 4. WEEK SUMMARY ──────────────────────────────
-    if any(w in ql for w in ["week summary", "summary", "weekly", "how was week", "w9", "w10"]) or filter_wk:
+    if (any(w in ql for w in ["week summary", "summary", "weekly", "how was week", "w9", "w10"]) or filter_wk) and not has_spike_q:
         target_wk = filter_wk or w1_week
         if target_wk is None:
             return "Please specify a week, e.g. `W9 summary` or `W10 2026`.", pd.DataFrame()
@@ -1932,7 +1942,8 @@ def smart_rule_analyst(q: str, alarm_choice: str, df_alarm: pd.DataFrame,
 
     # ── 5. SPIKE / TREND ANALYSIS ────────────────────
     if any(w in ql for w in ["spike", "jump", "surge", "increase", "why", "root cause", "cause",
-                               "trend", "went up", "gone up", "higher", "increased"]):
+                               "trend", "went up", "gone up", "higher", "increased",
+                               "improving", "worsening", "getting better", "getting worse"]):
         if weekly_sum is None or weekly_sum.empty:
             return "Weekly trend data not available.", pd.DataFrame()
         ws         = weekly_sum.copy().sort_values("alarm_week")
@@ -2032,7 +2043,7 @@ def smart_rule_analyst(q: str, alarm_choice: str, df_alarm: pd.DataFrame,
         return ans, trend_tbl
 
     # ── 6. FLEET OVERVIEW / GENERAL ──────────────────
-    if any(w in ql for w in ["overview", "fleet", "overall", "status", "all", "total", "how many"]):
+    if any(w in ql for w in ["overview", "fleet", "overall", "status", "all", "total", "how many"]) and not has_spike_q:
         dset = df_q if not df_q.empty else df
         total = len(dset)
         drivers = dset["driver_id"].nunique()
@@ -3429,12 +3440,14 @@ Be direct, specific, operational — no generic steps or instructions.
     ]
 
     # ── Badge & intro ────────────────────────────────────────────────────
+    _ctx = st.session_state.chat_context or {}
     if llm:
         mode_label = "ReAct Agent" if (LANGCHAIN_OK and react_agent) else "AI Analyst (Direct)"
+        _recs = _ctx.get("total_records_loaded", 0)
+        _wks  = len(_ctx.get("weekly_trend", []))
         st.markdown(
             f'<span class="badge-blue">✅ {mode_label} — Full data context loaded '
-            f'({st.session_state.chat_context.get("total_records_loaded", 0):,} records, '
-            f'last {len(st.session_state.chat_context.get("weekly_trend", []))} weeks)</span>',
+            f'({_recs:,} records, last {_wks} weeks)</span>',
             unsafe_allow_html=True)
     else:
         st.markdown('<span class="badge-amber">ℹ️ Rule-based mode — configure .env for full AI analyst</span>',
