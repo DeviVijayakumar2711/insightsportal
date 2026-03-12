@@ -1387,210 +1387,6 @@ def build_agent_tools(df_alarm, weekly_sum, total_hc, alarm_choice, df_raw, depo
         return "\n".join(str(x) for x in lines)
 
     # ────────────────────────────────────────────────────────────────────
-    # TOOL 12 — Spike / Week-on-Week Root Cause (NEW — cross-dimensional)
-    # ────────────────────────────────────────────────────────────────────
-    def tool_spike_analysis(week_str: str) -> str:
-        """
-        Deep spike analysis: compares target week vs prior week across
-        depot × service × bus model × driver dimensions to pinpoint
-        exactly what drove the increase. Flags new entrants, model-level
-        issues (e.g. BYD/EV), and gives a ranked factor table.
-        """
-        wk = None; yr = None
-        m = re.search(r"w?(\d{1,2})", week_str.lower())
-        if m: wk = int(m.group(1))
-        m2 = re.search(r"\b(20\d{2})\b", week_str)
-        if m2: yr = int(m2.group(1))
-        if wk is None:
-            # default to latest week
-            wk = int(df_alarm["alarm_week"].max()) if not df_alarm.empty else None
-        if wk is None:
-            return "No data available."
-        if yr is None and not weekly_sum.empty:
-            yr = int(weekly_sum["alarm_year"].dropna().max())
-
-        dw   = df_alarm[df_alarm["alarm_week"] == wk]
-        if yr: dw = dw[dw["alarm_year"] == yr]
-        dprev = df_alarm[df_alarm["alarm_week"] == wk - 1]
-        if yr: dprev = dprev[dprev["alarm_year"] == yr]
-
-        if dw.empty:
-            return f"No data for W{wk}."
-
-        hc = max(1, total_hc)
-        cur_rate  = _safe_rate(len(dw),    dw["trip_id_norm"].nunique())
-        prev_rate = _safe_rate(len(dprev), dprev["trip_id_norm"].nunique()) if not dprev.empty else None
-        delta     = round(cur_rate - prev_rate, 3) if prev_rate is not None else None
-        direction = "▲ UP" if (delta or 0) > 0 else "▼ DOWN"
-
-        lines = [
-            f"## Spike Analysis — W{wk} {yr or ''} | {alarm_choice}",
-            f"**Rate:** {cur_rate:.3f}/BC"
-            + (f" | **W{wk-1}:** {prev_rate:.3f} | **Change:** {delta:+.3f} {direction}" if prev_rate else ""),
-            "",
-        ]
-
-        # ── DIMENSION 1: Depot contribution change ───────────────────────
-        lines.append("### 1️⃣ Depot Contribution")
-        if _has_depot:
-            dep_rows = []
-            for dep in sorted(set(list(dw["depot_id"].unique()) + list(dprev["depot_id"].unique()))):
-                dc   = dw[dw["depot_id"] == dep]
-                dp   = dprev[dprev["depot_id"] == dep]
-                rc   = _safe_rate(len(dc), dc["trip_id_norm"].nunique())
-                rp   = _safe_rate(len(dp), dp["trip_id_norm"].nunique()) if not dp.empty else 0.0
-                chg  = rc - rp
-                flag = " 🔴 DROVE SPIKE" if chg > 0.3 else (" 🟡 ELEVATED" if rc > 3 else "")
-                dep_rows.append((dep, len(dc), rc, rp, chg, flag))
-            dep_rows.sort(key=lambda x: -x[4])  # sort by change desc
-            for dep, cnt, rc, rp, chg, flag in dep_rows:
-                lines.append(f"  • **{dep}**: {cnt:,} alarms | rate {rc:.3f} (was {rp:.3f}) | Δ{chg:+.3f}{flag}")
-        else:
-            lines.append("  No depot data.")
-
-        # ── DIMENSION 2: Bus Model analysis ──────────────────────────────
-        lines.append("\n### 2️⃣ Bus Model Breakdown")
-        if _has_model:
-            model_rows = []
-            for mdl in sorted(set(list(dw["model"].unique()) + list(dprev["model"].unique()))):
-                mc  = dw[dw["model"] == mdl]
-                mp  = dprev[dprev["model"] == mdl]
-                rc  = _safe_rate(len(mc), mc["trip_id_norm"].nunique())
-                rp  = _safe_rate(len(mp), mp["trip_id_norm"].nunique()) if not mp.empty else 0.0
-                chg = rc - rp
-                n_buses = mc["bus_no"].nunique()
-                # EV / BYD / Zhongtong flag — these models may have sensor sensitivity differences
-                is_ev   = any(x in mdl.upper() for x in ["BYD","ZHONGTONG","EV","ELECTRIC"])
-                ev_note = " ⚡EV — check sensor sensitivity vs diesel baseline" if is_ev else ""
-                flag    = " 🔴 MODEL-WIDE ISSUE" if (rc > _fleet_rate * 1.5 and n_buses >= 3) else (
-                          " 🟡 ELEVATED" if rc > _fleet_rate else "")
-                model_rows.append((mdl, len(mc), rc, rp, chg, n_buses, flag + ev_note))
-            model_rows.sort(key=lambda x: -x[2])  # sort by current rate
-            for mdl, cnt, rc, rp, chg, nb, flag in model_rows:
-                lines.append(f"  • **{mdl}** ({nb} buses): {cnt:,} alarms | rate {rc:.3f} (was {rp:.3f}) | Δ{chg:+.3f}{flag}")
-            # EV vs Diesel summary
-            ev_d   = dw[dw["model"].str.contains("EV|BYD|Zhongtong|ZHONGTONG|Electric|ELECTRIC",
-                                                  case=False, na=False, regex=True)]
-            dies_d = dw[~dw["model"].str.contains("EV|BYD|Zhongtong|ZHONGTONG|Electric|ELECTRIC",
-                                                   case=False, na=False, regex=True)]
-            if not ev_d.empty and not dies_d.empty:
-                ev_r   = _safe_rate(len(ev_d),   ev_d["trip_id_norm"].nunique())
-                dies_r = _safe_rate(len(dies_d), dies_d["trip_id_norm"].nunique())
-                diff   = ev_r - dies_r
-                lines.append(f"\n  **EV vs Diesel comparison:** EV rate {ev_r:.3f} | Diesel rate {dies_r:.3f} | "
-                              f"Diff {diff:+.3f} "
-                              f"{'⚡ EV fleet higher — may reflect sensor calibration or driving profile differences' if diff > 0.3 else '✅ No significant EV vs Diesel gap'}")
-        else:
-            lines.append("  No model data available.")
-
-        # ── DIMENSION 3: Service route analysis ──────────────────────────
-        lines.append("\n### 3️⃣ Service Route Contribution")
-        svc_rows = []
-        for svc in dw["svc_no"].value_counts().head(8).index:
-            sc  = dw[dw["svc_no"] == svc]
-            sp  = dprev[dprev["svc_no"] == svc] if not dprev.empty else pd.DataFrame()
-            rc  = _safe_rate(len(sc), sc["trip_id_norm"].nunique())
-            rp  = _safe_rate(len(sp), sp["trip_id_norm"].nunique()) if not sp.empty else 0.0
-            chg = rc - rp
-            nd  = sc["driver_id"].nunique()
-            nb  = sc["bus_no"].nunique()
-            # Route vs driver signal
-            if nd >= 3 and rc > _fleet_rate * 1.5:
-                signal = "🔴 ROUTE-WIDE (many drivers affected)"
-            elif nd <= 2 and rc > _fleet_rate:
-                signal = "🟡 DRIVER-SPECIFIC on this route"
-            else:
-                signal = ""
-            svc_rows.append((svc, len(sc), rc, rp, chg, nd, nb, signal))
-        svc_rows.sort(key=lambda x: -x[2])
-        for svc, cnt, rc, rp, chg, nd, nb, sig in svc_rows[:6]:
-            lines.append(f"  • **Svc {svc}**: {cnt:,} alarms | rate {rc:.3f} (was {rp:.3f}) | "
-                         f"Δ{chg:+.3f} | {nd} drivers | {nb} buses {sig}")
-
-        # ── DIMENSION 4: Cross-combo hotspots (bus × service × model) ────
-        lines.append("\n### 4️⃣ Cross-Combo Hotspots (Bus × Service × Model)")
-        combos = (dw.groupby(["bus_no", "svc_no", "model"] if _has_model else ["bus_no", "svc_no"])
-                  .agg(alarms=("trip_id_norm","count"), trips=("trip_id_norm","nunique"))
-                  .reset_index())
-        combos["rate"] = combos.apply(lambda r: _safe_rate(r.alarms, r.trips), axis=1)
-        combos = combos[combos["rate"] > _fleet_rate * 1.5].sort_values("rate", ascending=False).head(8)
-        if combos.empty:
-            lines.append("  No high-rate bus×service combos detected.")
-        else:
-            for _, row in combos.iterrows():
-                mdl_str = f" [{row['model']}]" if _has_model and "model" in row else ""
-                ev_flag = " ⚡EV" if _has_model and any(x in str(row.get("model","")).upper()
-                                                        for x in ["BYD","EV","ZHONGTONG"]) else ""
-                lines.append(f"  • Bus **{row['bus_no']}** on Svc **{row['svc_no']}**{mdl_str}{ev_flag}: "
-                              f"{row['alarms']} alarms / {row['trips']} trips = **{row['rate']:.3f}/trip** 🔴")
-
-        # ── DIMENSION 5: New entrants (not in top-10 last week) ──────────
-        lines.append("\n### 5️⃣ New Entrants This Week")
-        top_curr = set(dw["driver_id"].value_counts().head(10).index)
-        top_prev = set(dprev["driver_id"].value_counts().head(10).index) if not dprev.empty else set()
-        new_drv  = top_curr - top_prev
-        if new_drv:
-            lines.append(f"  Drivers new to top-10 (weren't in top-10 last week):")
-            for drv in new_drv:
-                dr   = dw[dw["driver_id"] == drv]
-                rate = _safe_rate(len(dr), dr["trip_id_norm"].nunique())
-                dep  = dr["depot_id"].mode()[0] if _has_depot and not dr.empty else "?"
-                mdl  = dr["model"].mode()[0] if _has_model and not dr.empty else ""
-                lines.append(f"    • Driver **{drv}** [{dep}] {f'[{mdl}]' if mdl else ''}: "
-                              f"{len(dr)} alarms | {rate:.3f}/trip 🆕")
-        else:
-            lines.append("  No new entrants — same drivers as last week.")
-
-        # ── VERDICT ──────────────────────────────────────────────────────
-        lines.append("\n### ✅ Verdict & Recommended Actions")
-
-        # Score each dimension
-        depot_driven  = _has_depot and any(r[4] > 0.3 for r in dep_rows) if _has_depot else False
-        model_driven  = _has_model and any(r[2] > _fleet_rate * 1.5 and r[5] >= 3
-                                           for r in model_rows) if _has_model else False
-        route_driven  = any(r[3] == "🔴 ROUTE-WIDE (many drivers affected)"
-                            for r in svc_rows) if svc_rows else False
-        combo_driven  = not combos.empty
-
-        if model_driven:
-            top_mdl = max(model_rows, key=lambda x: x[2])
-            is_ev_issue = any(x in top_mdl[0].upper() for x in ["BYD","EV","ZHONGTONG"])
-            lines.append(f"  🔴 **MODEL-LEVEL ISSUE** — **{top_mdl[0]}** showing rate {top_mdl[2]:.3f}/BC "
-                         f"({'EV sensor calibration review recommended' if is_ev_issue else 'mechanical/sensor check recommended'})")
-        if depot_driven:
-            top_dep_row = max(dep_rows, key=lambda x: x[4])
-            lines.append(f"  🔴 **DEPOT-DRIVEN** — **{top_dep_row[0]}** drove largest increase "
-                         f"(Δ{top_dep_row[4]:+.3f}) → Depot Head to review operations")
-        if route_driven:
-            lines.append(f"  🟠 **ROUTE-WIDE** — Multiple drivers affected on same service → route safety audit")
-        if combo_driven:
-            lines.append(f"  🟡 **BUS×SERVICE COMBOS** — Specific bus+route combinations elevated → "
-                         f"check bus assignment to high-risk routes")
-        if new_drv:
-            lines.append(f"  🟡 **NEW CONTRIBUTORS** — {len(new_drv)} driver(s) new to top-10 → "
-                         f"check for recent route/bus reassignment")
-        if not any([model_driven, depot_driven, route_driven, combo_driven, new_drv]):
-            lines.append("  🟢 No single dominant factor — distributed across fleet. "
-                         "Monitor next week before escalating.")
-
-        lines.append(f"\n| Priority | Action | Target | Evidence |")
-        lines.append(f"|----------|--------|--------|---------|")
-        if model_driven:
-            top_m = max(model_rows, key=lambda x: x[2])
-            ev    = "EV sensor calibration check" if any(x in top_m[0].upper() for x in ["BYD","EV","ZHONGTONG"]) else "Sensor/mechanical inspection"
-            lines.append(f"| High | {ev} | {top_m[0]} buses | Rate {top_m[2]:.3f} vs fleet {_fleet_rate:.3f} |")
-        if depot_driven:
-            td = max(dep_rows, key=lambda x: x[4])
-            lines.append(f"| High | Depot Head review | {td[0]} | Rate Δ{td[4]:+.3f} this week |")
-        if combo_driven and not combos.empty:
-            top_c = combos.iloc[0]
-            lines.append(f"| Medium | Review bus-route assignment | Bus {top_c['bus_no']} on Svc {top_c['svc_no']} | {top_c['rate']:.3f}/trip |")
-        if new_drv:
-            lines.append(f"| Medium | Monitor and advise | {', '.join(list(new_drv)[:3])} | New to top-10 this week |")
-
-        return "\n".join(lines)
-
-    # ────────────────────────────────────────────────────────────────────
     # Return all tools
     # ────────────────────────────────────────────────────────────────────
     return [
@@ -1605,19 +1401,17 @@ def build_agent_tools(df_alarm, weekly_sum, total_hc, alarm_choice, df_raw, depo
         Tool(name="model_analysis",       func=tool_model_analysis,
              description="Compare alarm rates by bus model — flags systematic vehicle-type issues. Input: empty string"),
         Tool(name="find_patterns",        func=tool_find_patterns,
-             description="USE FOR: repeat/persistent/chronic contributors, buses or drivers appearing across multiple weeks, cross-entity combos (driver+bus, route+model). Input: empty string. DO NOT use spike_analysis for repeat/persistent questions."),
+             description="Cross-entity pattern finder: driver+bus combos, driver+service combos, model+depot hotspots, chronic contributors. Input: empty string"),
         Tool(name="detect_anomalies",     func=tool_detect_anomalies,
              description="Statistical anomaly detection: 2SD outliers, low-trip high-rate, week-on-week spikes, new entrants to top-10. Input: empty string"),
         Tool(name="weekly_trend",         func=tool_weekly_trend,
              description="Fleet weekly trend with depot breakdown and momentum. Input: number of weeks e.g. '8'"),
         Tool(name="top_contributors",        func=tool_top_contributors,
-             description="USE FOR: top N drivers/buses/services by alarm count in the current or a specific week. NOT for multi-week repeat/persistent patterns (use find_patterns for that). Input: 'driver', 'bus', 'svc', or 'model'"),
+             description="Top 15 contributors with depot, model, rate vs fleet. Input: 'driver', 'bus', 'svc', or 'model'"),
         Tool(name="week_summary",         func=tool_week_summary,
              description="Detailed week summary: depot, model, driver, bus, service, vs prior week. Input: 'W9' or 'W9 2026'"),
         Tool(name="root_cause_drill",     func=tool_root_cause_drill,
              description="Multi-dimension root cause: classifies DRIVER/VEHICLE/ROUTE/FLEET. Input: 'driver 30450', 'bus SMB123D', 'svc 97', 'depot KRANJI'"),
-        Tool(name="spike_analysis",       func=tool_spike_analysis,
-             description="USE FOR: why a specific week went up or down, what caused an increase/decrease. NOT for repeat/persistent/chronic questions. Input: week e.g. 'W9' or 'W9 2026'"),
     ]
 
 # ─────────────────────────────────────────────
@@ -1627,36 +1421,6 @@ REACT_PROMPT_TEMPLATE = """You are a Fleet Operations Analyst for bus telematics
 Alarm: {alarm_choice} | Depots: {depots}
 Thresholds: >5.0/BC=CRITICAL | 3.0-5.0=ELEVATED | <3.0=NORMAL
 
-══════════════════════════════════════════════
-CRITICAL: MATCH THE QUESTION TYPE TO THE CORRECT TOOL — DO NOT GUESS
-
-QUESTION TYPE → CORRECT TOOL (read carefully before picking):
-
-| If question asks about...                                        | Use this tool           |
-|------------------------------------------------------------------|-------------------------|
-| WHY a week went up/down / spike / increase / what caused rise    | spike_analysis          |
-| REPEAT / PERSISTENT / CHRONIC buses/drivers over multiple weeks  | find_patterns           |
-| TOP buses/drivers by alarm count THIS week or a specific week    | top_contributors        |
-| A specific driver by ID (e.g. "driver 30450")                    | driver_deep_profile     |
-| A specific bus by number (e.g. "bus SMB123D")                    | bus_deep_profile        |
-| A specific service/route (e.g. "service 75")                     | service_deep_profile    |
-| DEPOT comparison / which depot is worst                          | depot_compare           |
-| BUS MODEL comparison / EV vs diesel / BYD issues                 | model_analysis          |
-| WEEK SUMMARY for a specific week (e.g. "W9 summary")             | week_summary            |
-| TREND over weeks / is fleet improving                            | weekly_trend            |
-| ANOMALIES / statistical outliers / new entrants                  | detect_anomalies        |
-| CROSS COMBOS / same bus+driver+route patterns                    | find_patterns           |
-
-EXAMPLES — use these to calibrate:
-- "Which buses are repeat contributors across the last 4 weeks?" → find_patterns  (NOT spike_analysis)
-- "Which drivers keep appearing week after week?" → find_patterns  (NOT top_contributors)
-- "Why did HA go up in W9?" → spike_analysis  (NOT find_patterns)
-- "Top 10 buses this week" → top_contributors with input "bus"  (NOT find_patterns)
-- "What caused the increase last week?" → spike_analysis
-- "Which bus has the highest alarm rate?" → top_contributors with input "bus"
-- "Are there chronic problem buses?" → find_patterns
-══════════════════════════════════════════════
-
 TOOLS AVAILABLE:
 {tools}
 
@@ -1665,21 +1429,26 @@ MANDATORY FORMAT RULES — VIOLATION CAUSES FAILURE:
 1. After EVERY Thought you MUST write Action: then Action Input: (no exceptions)
 2. NEVER write Final Answer inside a Thought block
 3. Final Answer must be a standalone line ONLY after an Observation
-4. Use EXACTLY 1 tool — pick the right one first time
-5. Once you have data from a tool — go straight to Final Answer
-6. Answer ONLY what was asked — do not add unrequested analysis
+4. Use 1 tool for simple questions (depot compare, top list, weekly trend)
+5. Use 2-3 tools max for complex root cause questions
+6. Once you have data from a tool — go straight to Final Answer
 ══════════════════════════════════════════════
 
 CORRECT FORMAT — follow exactly:
 
 Question: {input}
-Thought: The question asks about [topic]. Based on the tool selection guide, I should use [tool].
+Thought: I will use [tool] to answer this.
 Action: [tool name — must be exactly one of: {tool_names}]
 Action Input: [input value]
 Observation: [tool result — provided automatically]
-Thought: I now have the data needed to answer the specific question asked.
+Thought: I now have the data I need to give a complete answer.
 Final Answer:
-[Answer focused ONLY on what was asked, with specific numbers and entity IDs in bold]
+## [Title]
+[Markdown answer with bold entity IDs, specific numbers, and a priority action table]
+
+| Priority | Action | Target | Evidence |
+|----------|--------|--------|---------|
+| High | ... | ... | ... |
 
 {agent_scratchpad}"""
 
@@ -1782,61 +1551,10 @@ def smart_rule_analyst(q: str, alarm_choice: str, df_alarm: pd.DataFrame,
             return ans, wk_breakdown
 
     # ── 2. TOP CONTRIBUTORS (drivers / buses / services / all) ──
-    kw_top     = any(w in ql for w in ["top", "offend", "highest", "high", "most alarm",
-                                        "most incident", "contributor", "contributing",
-                                        "repeat", "persistent", "chronic", "worst"])
-    kw_driver  = any(w in ql for w in ["driver", "bc", "captain", "operator"])
-    kw_bus     = any(w in ql for w in ["bus", "vehicle"])
-    kw_svc     = any(w in ql for w in ["service", "route", "svc"])
-    kw_repeat  = any(w in ql for w in ["repeat", "persistent", "chronic", "recurring",
-                                        "again", "consistent", "multiple week", "4 week",
-                                        "four week", "last 4", "last four", "across week"])
-
-    # ── 2a. REPEAT / PERSISTENT contributors (multi-week pattern) ────────
-    # Must be checked BEFORE spike/trend so "repeat buses" doesn't fall through to spike
-    if kw_repeat:
-        # Determine how many weeks to look back (default 4)
-        nwk_m = re.search(r"(\d+)\s*week", ql)
-        n_wks = int(nwk_m.group(1)) if nwk_m else 4
-        n_wks = max(2, min(n_wks, 12))
-
-        recent_weeks = sorted(df["alarm_week"].unique())[-n_wks:]
-        threshold    = max(2, n_wks - 1)   # must appear in at least n-1 of n weeks
-
-        entity_col  = "bus_no" if kw_bus else ("svc_no" if kw_svc else "driver_id")
-        entity_label = "Bus" if kw_bus else ("Service" if kw_svc else "Driver")
-
-        rows = []
-        for eid, grp in df[df["alarm_week"].isin(recent_weeks)].groupby(entity_col):
-            wks_present = grp["alarm_week"].nunique()
-            if wks_present >= threshold:
-                total_alarms = len(grp)
-                rate         = round(total_alarms / max(1, grp["trip_id_norm"].nunique()), 3)
-                depot        = grp["depot_id"].mode()[0] if "depot_id" in grp.columns and not grp.empty else "?"
-                model        = grp["model"].mode()[0] if "model" in grp.columns and not grp.empty else ""
-                wk_counts    = grp.groupby("alarm_week").size().to_dict()
-                rows.append({entity_label: str(eid), "Weeks Active": wks_present,
-                             "Total Alarms": total_alarms, "Avg Rate": rate,
-                             "Depot": depot, "Model": model,
-                             "Week Breakdown": " | ".join(f"W{int(w)}:{c}" for w, c in sorted(wk_counts.items()))})
-
-        if rows:
-            tbl = (pd.DataFrame(rows)
-                   .sort_values(["Weeks Active", "Total Alarms"], ascending=[False, False])
-                   .head(top_n))
-            display_cols = [entity_label, "Weeks Active", "Total Alarms", "Avg Rate", "Depot"]
-            if kw_bus and "Model" in tbl.columns and tbl["Model"].str.len().gt(0).any():
-                display_cols.insert(3, "Model")
-            ans = (f"## Repeat {entity_label}s — {alarm_choice} (Last {n_wks} weeks)\n\n"
-                   f"**{len(rows)} {entity_label.lower()}(s) appeared in {threshold}+ of the last {n_wks} weeks.**\n\n"
-                   f"*These are persistent contributors — not just one bad week.*\n\n"
-                   f"*Ask `bus <ID>` for a full profile of any bus below.*")
-            return ans, tbl[display_cols]
-        else:
-            return (f"## Repeat {entity_label}s — {alarm_choice}\n\n"
-                    f"No {entity_label.lower()}(s) appeared in {threshold}+ of the last {n_wks} weeks. "
-                    f"Contributions are spread across different {entity_label.lower()}s each week — no persistent pattern detected.",
-                    pd.DataFrame())
+    kw_top = any(w in ql for w in ["top", "offend", "highest", "high", "most alarm", "most incident"])
+    kw_driver = any(w in ql for w in ["driver", "bc", "captain", "operator"])
+    kw_bus    = any(w in ql for w in ["bus", "vehicle", "fleet"])
+    kw_svc    = any(w in ql for w in ["service", "route", "svc"])
 
     if kw_top or "ranking" in ql or "list" in ql:
         results = []
@@ -1931,103 +1649,44 @@ def smart_rule_analyst(q: str, alarm_choice: str, df_alarm: pd.DataFrame,
         return ans, tbl
 
     # ── 5. SPIKE / TREND ANALYSIS ────────────────────
-    if any(w in ql for w in ["spike", "jump", "surge", "increase", "why", "root cause", "cause",
-                               "trend", "went up", "gone up", "higher", "increased"]):
+    if any(w in ql for w in ["spike", "jump", "surge", "increase", "why", "root cause", "cause", "trend"]):
         if weekly_sum is None or weekly_sum.empty:
             return "Weekly trend data not available.", pd.DataFrame()
-        ws         = weekly_sum.copy().sort_values("alarm_week")
-        target_wk  = filter_wk or (w1_week if w1_week else int(ws["alarm_week"].iloc[-1]))
-        idx        = ws[ws["alarm_week"] == target_wk].index
+        ws = weekly_sum.copy().sort_values("alarm_week")
+        target_wk = filter_wk or (w1_week if w1_week else int(ws["alarm_week"].iloc[-1]))
+        idx = ws[ws["alarm_week"] == target_wk].index
         if len(idx) == 0:
             return f"No weekly data for W{target_wk}.", pd.DataFrame()
-
-        cur_rate  = float(ws.loc[idx[0], "per_bc"])
-        prev_idx  = ws.index.get_loc(idx[0])
+        cur_rate = float(ws.loc[idx[0], "per_bc"])
+        prev_idx = ws.index.get_loc(idx[0])
         prev_rate = float(ws.iloc[prev_idx - 1]["per_bc"]) if prev_idx > 0 else None
-        delta     = round(cur_rate - prev_rate, 3) if prev_rate else None
-        direction = f"▲ +{delta}" if delta and delta > 0 else (f"▼ {delta}" if delta else "N/A")
+        delta = round(cur_rate - prev_rate, 3) if prev_rate else None
 
-        dw    = df[df["alarm_week"] == target_wk]
-        dprev = df[df["alarm_week"] == target_wk - 1]
+        # Find what drove the spike
+        dw = df[df["alarm_week"] == target_wk]
+        top_dep = dw["depot_id"].value_counts().head(3).to_dict() if "depot_id" in dw.columns else {}
+        top_dr  = dw["driver_id"].value_counts().head(5).to_dict()
+        top_bs  = dw["bus_no"].value_counts().head(5).to_dict()
+        top_svc = dw["svc_no"].value_counts().head(5).to_dict() if "svc_no" in dw.columns else {}
 
-        # ── Depot change ─────────────────────────────
-        dep_lines = []
-        if "depot_id" in dw.columns:
-            for dep in dw["depot_id"].value_counts().head(4).index:
-                dc = dw[dw["depot_id"] == dep]
-                dp = dprev[dprev["depot_id"] == dep] if not dprev.empty else pd.DataFrame()
-                rc = len(dc) / max(1, dc["trip_id_norm"].nunique())
-                rp = len(dp) / max(1, dp["trip_id_norm"].nunique()) if not dp.empty else 0.0
-                chg = rc - rp
-                flag = " 🔴 SPIKE SOURCE" if chg > 0.3 else ""
-                dep_lines.append(f"  • {dep}: rate {rc:.3f} (was {rp:.3f}) Δ{chg:+.3f}{flag}")
-
-        # ── Bus model change ──────────────────────────
-        model_lines = []
-        if "model" in dw.columns:
-            for mdl in dw["model"].value_counts().head(5).index:
-                mc  = dw[dw["model"] == mdl]
-                mp  = dprev[dprev["model"] == mdl] if not dprev.empty else pd.DataFrame()
-                rc  = len(mc) / max(1, mc["trip_id_norm"].nunique())
-                rp  = len(mp) / max(1, mp["trip_id_norm"].nunique()) if not mp.empty else 0.0
-                chg = rc - rp
-                is_ev = any(x in mdl.upper() for x in ["BYD","EV","ZHONGTONG","ELECTRIC"])
-                ev_note = " ⚡EV" if is_ev else ""
-                flag = " 🔴 ELEVATED" if rc > 3.0 else ""
-                model_lines.append(f"  • {mdl}{ev_note}: rate {rc:.3f} (was {rp:.3f}) Δ{chg:+.3f}{flag}")
-            # EV vs Diesel
-            ev_d   = dw[dw["model"].str.contains("EV|BYD|Zhongtong|Electric", case=False, na=False, regex=True)]
-            dies_d = dw[~dw["model"].str.contains("EV|BYD|Zhongtong|Electric", case=False, na=False, regex=True)]
-            if not ev_d.empty and not dies_d.empty:
-                evr  = len(ev_d)  / max(1, ev_d["trip_id_norm"].nunique())
-                dr   = len(dies_d)/ max(1, dies_d["trip_id_norm"].nunique())
-                model_lines.append(f"  **EV {evr:.3f} vs Diesel {dr:.3f}** "
-                                   f"{'⚡ EV higher — sensor calibration check recommended' if evr > dr + 0.3 else '✅ No significant gap'}")
-
-        # ── Service route change ──────────────────────
-        svc_lines = []
-        if "svc_no" in dw.columns:
-            for svc in dw["svc_no"].value_counts().head(5).index:
-                sc  = dw[dw["svc_no"] == svc]
-                sp  = dprev[dprev["svc_no"] == svc] if not dprev.empty else pd.DataFrame()
-                rc  = len(sc) / max(1, sc["trip_id_norm"].nunique())
-                rp  = len(sp) / max(1, sp["trip_id_norm"].nunique()) if not sp.empty else 0.0
-                nd  = sc["driver_id"].nunique()
-                flag = " 🔴 ROUTE-WIDE" if (nd >= 3 and rc > 3.0) else ""
-                svc_lines.append(f"  • Svc {svc}: {len(sc)} alarms | {nd} drivers | rate {rc:.3f} (was {rp:.3f}){flag}")
-
-        # ── Cross-combo hotspots ──────────────────────
-        combo_lines = []
-        grp_cols = ["bus_no","svc_no"] + (["model"] if "model" in dw.columns else [])
-        if len(grp_cols) >= 2:
-            combos = (dw.groupby(grp_cols).size().reset_index(name="alarms")
-                      .sort_values("alarms", ascending=False).head(5))
-            for _, row in combos.iterrows():
-                mdl = f" [{row['model']}]" if "model" in row else ""
-                ev  = " ⚡" if "model" in row and any(x in str(row["model"]).upper()
-                                                       for x in ["BYD","EV","ZHONGTONG"]) else ""
-                combo_lines.append(f"  • Bus {row['bus_no']} × Svc {row['svc_no']}{mdl}{ev}: {row['alarms']} alarms")
-
-        # ── New entrants ──────────────────────────────
-        top_curr = set(dw["driver_id"].value_counts().head(10).index)
-        top_prev = set(dprev["driver_id"].value_counts().head(10).index) if not dprev.empty else set()
-        new_drv  = top_curr - top_prev
-
-        # ── Build answer ─────────────────────────────
+        direction = f"↑ +{delta}" if delta and delta > 0 else (f"↓ {delta}" if delta else "N/A")
         ans = (f"## Root Cause Analysis — W{target_wk} {alarm_choice}\n\n"
-               f"**Rate:** {cur_rate:.3f}/BC" +
-               (f" | **W{target_wk-1}:** {prev_rate:.3f} | **Change:** {delta:+.3f} {direction}\n\n"
-                if prev_rate else "\n\n") +
-               f"### 1️⃣ Depot Contribution\n" + ("\n".join(dep_lines) or "  No depot data.") + "\n\n" +
-               f"### 2️⃣ Bus Model Breakdown\n" + ("\n".join(model_lines) or "  No model data.") + "\n\n" +
-               f"### 3️⃣ Service Route Contribution\n" + ("\n".join(svc_lines) or "  No service data.") + "\n\n" +
-               f"### 4️⃣ Bus × Service Hotspots\n" + ("\n".join(combo_lines) or "  No hotspots.") + "\n\n" +
-               (f"### 5️⃣ New Contributors This Week\n  Drivers new to top-10: "
-                f"{', '.join(str(d) for d in new_drv)}\n\n" if new_drv else "") +
-               f"*Ask `driver <ID>` or `bus <No>` for a detailed profile of any entity above.*")
-
+               f"**Rate W{target_wk}:** {cur_rate:.3f}/BC | "
+               + (f"**vs W{target_wk-1}:** {prev_rate:.3f} ({direction})\n\n" if prev_rate else "\n\n") +
+               f"### Contributing Factors\n"
+               f"- **Depot breakdown:** {top_dep}\n"
+               f"- **Top drivers:** {top_dr}\n"
+               f"- **Top buses:** {top_bs}\n"
+               f"- **Top services:** {top_svc}\n\n"
+               f"### Likely Root Cause Classification\n"
+               + ("- 🔴 **FLEET-WIDE**: All depots elevated — check fleet-level factor (training, weather, route changes)\n"
+                  if len(top_dep) >= 3 and min(top_dep.values()) > 50
+                  else "- 🟠 **DEPOT-SPECIFIC**: One depot dominates — escalate to depot head\n"
+                  if top_dep and list(top_dep.values())[0] > sum(list(top_dep.values())[1:])
+                  else "- 🟡 **INDIVIDUAL OUTLIERS**: Concentrated in specific drivers/buses — target directly\n") +
+               f"\n*Ask `driver <ID>` for a full profile of any driver above.*")
         trend_tbl = ws[["alarm_week","per_bc"]].tail(8).rename(
-            columns={"alarm_week": "Week", "per_bc": "Rate/BC"})
+            columns={"alarm_week":"Week","per_bc":"Rate/BC"})
         trend_tbl["Week"] = "W" + trend_tbl["Week"].astype(int).astype(str)
         return ans, trend_tbl
 
@@ -3369,11 +3028,11 @@ Be direct, specific, and operational — no generic observations.
 
     # ── Suggested questions ─────────────────────────────────────────────
     SUGGESTED_QS = [
-        f"Why did {alarm_choice} go up in W{w1_week}? What drove the increase?",
-        "Who are the top 10 contributing drivers this week and which depot?",
+        f"Why did {alarm_choice} spike in W{w1_week}?",
+        "Who are the top 10 drivers this week and which depot are they from?",
         "Which buses are repeat contributors across the last 4 weeks?",
         "Compare depot performance — which has the highest rate?",
-        "Are BYD or EV buses contributing more alarms than diesel buses?",
+        f"What is the root cause for the highest offending driver?",
         "Is the fleet trend improving or worsening? Predict next week.",
         "Which service routes have the most alarms and why?",
     ]
@@ -3511,3 +3170,4 @@ Be direct, specific, and operational — no generic observations.
 
 if __name__ == "__main__":
     main()
+
