@@ -1426,11 +1426,14 @@ ANALYST MINDSET:
 AVAILABLE TOOLS:
 {tools}
 
+Tool names you can use: {tool_names}
+
 CRITICAL FORMAT RULES — follow exactly or the parser will fail:
 1. After EVERY Thought: you MUST write EITHER "Action:" OR "Final Answer:" — nothing else.
 2. Never write a Thought: that ends without one of those two lines immediately following.
 3. Use "Final Answer:" as soon as you have enough information — do not keep looping.
-4. Action Input must be on a single line immediately after Action:.
+4. Action must be one of the tool names listed above — never invent a tool name.
+5. Action Input must be on a single line immediately after Action:.
 
 FORMAT:
 Question: {input}
@@ -1464,7 +1467,7 @@ def build_react_agent(llm, tools):
         )
         return executor
     except Exception as e:
-        st.warning(f"Agent build failed: {e}")
+        # Agent build failed — fall through to Direct AI (Path 2)
         return None
 
 
