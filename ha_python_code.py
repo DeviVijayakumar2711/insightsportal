@@ -1426,33 +1426,28 @@ ANALYST MINDSET:
 AVAILABLE TOOLS:
 {tools}
 
-STRICT FORMAT:
-Question: {input}
-Thought: What dimensions do I need to investigate? What tools will give me evidence?
-Action: [one of {tool_names}]
-Action Input: [exact input]
-Observation: [tool result]
-Thought: What does this tell me? What else do I need?
-Action: [next tool]
-Action Input: [input]
-Observation: [result]
-... (use up to 5 tools — use more for complex questions)
-Thought: I have multi-dimensional evidence. I can now give a definitive answer.
-Final Answer:
-## [Question Answer Title]
+CRITICAL FORMAT RULES — follow exactly or the parser will fail:
+1. After EVERY Thought: you MUST write EITHER "Action:" OR "Final Answer:" — nothing else.
+2. Never write a Thought: that ends without one of those two lines immediately following.
+3. Use "Final Answer:" as soon as you have enough information — do not keep looping.
+4. Action Input must be on a single line immediately after Action:.
 
-[Rich structured markdown with:]
-- Specific numbers for every claim
-- Bold for entity IDs and key metrics
-- Root cause classification with evidence
-- Comparison vs fleet average
-- Priority action table at the end
+FORMAT:
+Question: {input}
+Thought: What tool do I need first?
+Action: top_offenders
+Action Input: driver
+Observation: [result]
+Thought: I have the data I need. I can now answer.
+Final Answer:
+## [Title]
+[Rich markdown answer with specific IDs, counts, rates, root cause, and action table]
 
 | Priority | Action | Target | Evidence |
 |----------|--------|--------|---------|
-| 1 | ... | ... | ... |
+| High | ... | ... | ... |
 
-Thought: {agent_scratchpad}"""
+{agent_scratchpad}"""
 
 def build_react_agent(llm, tools):
     if llm is None or not LANGCHAIN_OK or AgentExecutor is None: return None
@@ -1460,8 +1455,11 @@ def build_react_agent(llm, tools):
         prompt   = PromptTemplate.from_template(REACT_PROMPT_TEMPLATE)
         agent    = create_react_agent(llm, tools, prompt)
         executor = AgentExecutor(
-            agent=agent, tools=tools, verbose=True,
-            handle_parsing_errors=True, max_iterations=6,
+            agent=agent, tools=tools, verbose=False,
+            handle_parsing_errors="Format error — please write 'Action: <tool>' or 'Final Answer: <answer>' after your Thought.",
+            max_iterations=4,
+            max_execution_time=25,
+            early_stopping_method="generate",
             return_intermediate_steps=True,
         )
         return executor
@@ -3046,9 +3044,13 @@ Be direct, specific, and operational — no generic observations.
                                 "alarm_choice": alarm_choice,
                                 "depots": ", ".join(depots),
                             })
-                            answer = result.get("output", "")
+                            raw_sq = result.get("output", "")
                             steps  = result.get("intermediate_steps", [])
-                            st.session_state.chat_steps[len(st.session_state.chat_log)] = steps
+                            _bad = ("agent stopped", "iteration limit", "time limit",
+                                    "format error", "invalid format", "parsing error")
+                            if raw_sq and not any(b in raw_sq.lower() for b in _bad):
+                                answer = raw_sq
+                                st.session_state.chat_steps[len(st.session_state.chat_log)] = steps
                         except Exception:
                             answer = None
                     if not answer and llm:
@@ -3117,11 +3119,17 @@ Be direct, specific, and operational — no generic observations.
                         "alarm_choice": alarm_choice,
                         "depots": ", ".join(depots),
                     })
-                    answer = result.get("output", "")
+                    raw_answer = result.get("output", "")
                     steps  = result.get("intermediate_steps", [])
-                    msg_idx = len(st.session_state.chat_log)
-                    st.session_state.chat_steps[msg_idx] = steps
-                except Exception as e:
+                    # Discard agent output if it's a failure message or empty
+                    _bad = ("agent stopped", "iteration limit", "time limit",
+                            "format error", "invalid format", "parsing error")
+                    if raw_answer and not any(b in raw_answer.lower() for b in _bad):
+                        answer = raw_answer
+                        msg_idx = len(st.session_state.chat_log)
+                        st.session_state.chat_steps[msg_idx] = steps
+                    # else: fall through to Path 2
+                except Exception:
                     answer = None  # fall through
 
             # ── Path 2: Direct AI with full context + conversation memory ──
