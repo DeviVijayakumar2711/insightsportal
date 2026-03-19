@@ -2715,7 +2715,19 @@ Rules: state CRITICAL/ELEVATED/NORMAL, mention trend direction, identify primary
                 _wk_s = _wk_s.sort_values("start_of_week")
                 if _wk_s.empty: continue
 
-                _lwk  = int(_wk_s["alarm_week"].iloc[-1])
+                # Pick the "current" week smartly:
+                # If the last week has very few alarms (<5% of the prior week),
+                # it's likely a sparse future week with stray records — use prior week instead.
+                _last_wk  = int(_wk_s["alarm_week"].iloc[-1])
+                _last_cnt = int(_wk_s[_wk_s["alarm_week"] == _last_wk]["alarm_sum"].sum())
+                if len(_wk_s) >= 2:
+                    _prev_wk  = int(_wk_s["alarm_week"].iloc[-2])
+                    _prev_cnt = int(_wk_s[_wk_s["alarm_week"] == _prev_wk]["alarm_sum"].sum())
+                    # If last week has fewer than 10% of prior week's alarms, treat prior week as current
+                    _lwk = _last_wk if (_prev_cnt == 0 or _last_cnt >= _prev_cnt * 0.10) else _prev_wk
+                else:
+                    _lwk = _last_wk
+
                 _proj, _, _ = calculate_smart_forecast(_df_snap, _wk_s, _lwk, _t5_hc)
 
                 # Also compute the raw current-week rate (alarms so far / HC)
