@@ -2699,10 +2699,27 @@ Rules: state CRITICAL/ELEVATED/NORMAL, mention trend direction, identify primary
             for a_type in ["HA","HB","HC"]:
                 # Use only_completed=False so current incomplete week is included in forecast
                 _df_f, _, _ = slice_by_filters(df_raw, weekly_all, depots_tuple, a_type, False, exclude_null)
-                _df_snap = _df_f[_df_f["alarm_date"] <= pd.to_datetime(report_date)] if not _df_f.empty else _df_f
+
+                # Step 1: Snap to report_date — no future records
+                _report_dt = pd.to_datetime(report_date)
+                _df_snap = _df_f[_df_f["alarm_date"] <= _report_dt] if not _df_f.empty else _df_f
                 if _df_snap.empty: continue
 
-                # Rebuild per-week summary directly from the date-snapped events
+                # Step 2: Determine the current week/year from report_date directly
+                # This is the authoritative "current week" — never inferred from data
+                _report_iso = _report_dt.isocalendar()
+                _lwk        = int(_report_iso.week)
+                _lwk_year   = int(_report_iso.year)
+
+                # Step 3: Filter _df_snap to ONLY weeks up to and including _lwk/_lwk_year
+                # This removes any stray future-week records that sneak past the date filter
+                _df_snap = _df_snap[
+                    (_df_snap["alarm_year"] < _lwk_year) |
+                    ((_df_snap["alarm_year"] == _lwk_year) & (_df_snap["alarm_week"] <= _lwk))
+                ]
+                if _df_snap.empty: continue
+
+                # Step 4: Rebuild per-week summary from the clean snapped data
                 _wk_s = (
                     _df_snap.groupby(["alarm_year","alarm_week"], as_index=False)
                     .size().rename(columns={"size":"alarm_sum"})
@@ -2714,19 +2731,6 @@ Rules: state CRITICAL/ELEVATED/NORMAL, mention trend direction, identify primary
                     format="%G%V%w", errors="coerce")
                 _wk_s = _wk_s.sort_values("start_of_week")
                 if _wk_s.empty: continue
-
-                # Pick the "current" week smartly:
-                # If the last week has very few alarms (<5% of the prior week),
-                # it's likely a sparse future week with stray records — use prior week instead.
-                _last_wk  = int(_wk_s["alarm_week"].iloc[-1])
-                _last_cnt = int(_wk_s[_wk_s["alarm_week"] == _last_wk]["alarm_sum"].sum())
-                if len(_wk_s) >= 2:
-                    _prev_wk  = int(_wk_s["alarm_week"].iloc[-2])
-                    _prev_cnt = int(_wk_s[_wk_s["alarm_week"] == _prev_wk]["alarm_sum"].sum())
-                    # If last week has fewer than 10% of prior week's alarms, treat prior week as current
-                    _lwk = _last_wk if (_prev_cnt == 0 or _last_cnt >= _prev_cnt * 0.10) else _prev_wk
-                else:
-                    _lwk = _last_wk
 
                 _proj, _, _ = calculate_smart_forecast(_df_snap, _wk_s, _lwk, _t5_hc)
 
