@@ -2717,8 +2717,16 @@ Rules: state CRITICAL/ELEVATED/NORMAL, mention trend direction, identify primary
 
                 _lwk  = int(_wk_s["alarm_week"].iloc[-1])
                 _proj, _, _ = calculate_smart_forecast(_df_snap, _wk_s, _lwk, _t5_hc)
-                if _proj > 3.0:
-                    max_proj = max(max_proj, _proj)
+
+                # Also compute the raw current-week rate (alarms so far / HC)
+                # Use whichever is higher — prevents blending logic from masking
+                # a progressing week that is already above threshold
+                _curr_wk_events = _df_snap[_df_snap["alarm_week"] == _lwk]
+                _raw_curr_rate  = len(_curr_wk_events) / _t5_hc if _t5_hc > 0 else 0.0
+                _effective_rate = max(_proj, _raw_curr_rate)
+
+                if _effective_rate > 3.0:
+                    max_proj = max(max_proj, _effective_rate)
                     curr  = _df_snap[_df_snap["alarm_week"] == _lwk]
                     top10 = (curr.groupby(["depot_id","svc_no","bus_no","model","driver_id"])
                              .size().sort_values(ascending=False).head(10).reset_index(name="count"))
@@ -2726,9 +2734,12 @@ Rules: state CRITICAL/ELEVATED/NORMAL, mention trend direction, identify primary
                         f"<tr><td>{r.depot_id}</td><td>{r.svc_no}</td><td>{r.bus_no}</td>"
                         f"<td>{r.model}</td><td>{r.driver_id}</td><td>{r['count']}</td></tr>"
                         for _, r in top10.iterrows())
-                    risk_label = "Medium Risk (>3.0)" if _proj <= 5.0 else "Critical Risk (>5.0)"
+                    risk_label = "Medium Risk (>3.0)" if _effective_rate <= 5.0 else "Critical Risk (>5.0)"
+                    # Show projected rate if forecast > raw, else show raw with note
+                    _display_rate = _proj if _proj >= _raw_curr_rate else _raw_curr_rate
+                    _rate_note = " (projected)" if _proj >= _raw_curr_rate else " (current week rate — week in progress)"
                     summaries.append(
-                        f"Projected value for end of the week ({a_type}): {_proj:.2f} [{risk_label}]"
+                        f"Projected value for end of the week ({a_type}): {_display_rate:.2f}{_rate_note} [{risk_label}]"
                     )
                     active_alerts.append(f"""
 <h3>Top Contributing Factors for {a_type}</h3>
