@@ -2061,19 +2061,6 @@ def main():
         df_raw, weekly_all, depots_tuple, alarm_choice, only_completed, exclude_null)
     weekly_sum, total_hc = per_week_kpis(weekly, headcounts, depots_tuple)
 
-    # ── Agent ────────────────────────────────
-    # Cache agent tools in session_state — only rebuild when data/alarm/depots change
-    _agent_key = f"{alarm_choice}_{depots_tuple}_{w1_week}_{len(df_alarm)}"
-    if st.session_state.get("_agent_key") != _agent_key or st.session_state.get("_agent_tools") is None:
-        agent_tools = build_agent_tools(df_alarm, weekly_sum, total_hc, alarm_choice, df_raw, depots_tuple)
-        react_agent = build_react_agent(llm, agent_tools) if llm else None
-        st.session_state["_agent_key"]   = _agent_key
-        st.session_state["_agent_tools"] = agent_tools
-        st.session_state["_react_agent"] = react_agent
-    else:
-        agent_tools = st.session_state["_agent_tools"]
-        react_agent = st.session_state["_react_agent"]
-
     # ── FEATURE 3: DRIVER WATCH LIST in sidebar ──────────────────────
     if not df_alarm.empty:
         with st.sidebar:
@@ -2152,6 +2139,18 @@ def main():
     k3.metric("Headcount (selected)",         f"{int(total_hc):,}")
     active_drv = df_alarm[df_alarm["alarm_week"]==w1_week]["driver_id"].nunique() if not df_alarm.empty else 0
     k4.metric("Drivers with Alarms",          f"{active_drv:,}")
+
+    # Agent cached in session_state — w1_week and all vars now defined
+    _agent_key = f"{alarm_choice}_{depots_tuple}_{w1_week}_{len(df_alarm)}"
+    if st.session_state.get("_agent_key") != _agent_key or st.session_state.get("_agent_tools") is None:
+        agent_tools = build_agent_tools(df_alarm, weekly_sum, total_hc, alarm_choice, df_raw, depots_tuple)
+        react_agent = build_react_agent(llm, agent_tools) if llm else None
+        st.session_state["_agent_key"]   = _agent_key
+        st.session_state["_agent_tools"] = agent_tools
+        st.session_state["_react_agent"] = react_agent
+    else:
+        agent_tools = st.session_state["_agent_tools"]
+        react_agent = st.session_state["_react_agent"]
 
     st.markdown("---")
 
