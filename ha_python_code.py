@@ -57,7 +57,7 @@ _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 _ENV_PATH   = os.path.join(_SCRIPT_DIR, ".env")
 load_dotenv(dotenv_path=_ENV_PATH, override=True)
 
-APP_VERSION = "v-azure-2025-genai-v3"
+APP_VERSION = "v-azure-2025-genai-v4-optimised"
 
 # ─────────────────────────────────────────────
 # PAGE CONFIG
@@ -286,7 +286,7 @@ class _DirectAzureLLM:
 # LLM INITIALISATION — re-reads .env every call
 # Tries LangChain first, falls back to direct openai SDK
 # ─────────────────────────────────────────────
-@st.cache_resource
+@st.cache_resource(ttl=1800)
 def _create_llm_langchain(endpoint: str, api_key: str, deploy: str, api_ver: str):
     """LangChain-backed LLM — cached by credential values."""
     llm = AzureChatOpenAI(
@@ -297,7 +297,7 @@ def _create_llm_langchain(endpoint: str, api_key: str, deploy: str, api_ver: str
     llm.predict("ping")   # verify connectivity
     return llm
 
-@st.cache_resource
+@st.cache_resource(ttl=1800)
 def _create_llm_direct(endpoint: str, api_key: str, deploy: str, api_ver: str):
     """Direct openai SDK LLM — cached by credential values."""
     client = _AzureOpenAI(
@@ -367,6 +367,7 @@ def _file_accessible(p: str) -> bool:
     if str(p).lower().startswith("http"): return True
     return os.path.exists(str(p))
 
+@st.cache_data(show_spinner=False)
 def load_and_process_data(tele_file, excl_file, head_file, model_file, _mtime):
     df_raw   = smart_read_csv(tele_file)
     df_excl  = smart_read_csv(excl_file)  if _file_accessible(excl_file)  else pd.DataFrame()
@@ -1460,8 +1461,8 @@ def build_react_agent(llm, tools):
         executor = AgentExecutor(
             agent=agent, tools=tools, verbose=False,
             handle_parsing_errors="Format error — please write 'Action: <tool>' or 'Final Answer: <answer>' after your Thought.",
-            max_iterations=4,
-            max_execution_time=25,
+            max_iterations=3,
+            max_execution_time=18,
             early_stopping_method="generate",
             return_intermediate_steps=True,
         )
@@ -2061,8 +2062,17 @@ def main():
     weekly_sum, total_hc = per_week_kpis(weekly, headcounts, depots_tuple)
 
     # ── Agent ────────────────────────────────
-    agent_tools = build_agent_tools(df_alarm, weekly_sum, total_hc, alarm_choice, df_raw, depots_tuple)
-    react_agent = build_react_agent(llm, agent_tools) if llm else None
+    # Cache agent tools in session_state — only rebuild when data/alarm/depots change
+    _agent_key = f"{alarm_choice}_{depots_tuple}_{w1_week}_{len(df_alarm)}"
+    if st.session_state.get("_agent_key") != _agent_key or st.session_state.get("_agent_tools") is None:
+        agent_tools = build_agent_tools(df_alarm, weekly_sum, total_hc, alarm_choice, df_raw, depots_tuple)
+        react_agent = build_react_agent(llm, agent_tools) if llm else None
+        st.session_state["_agent_key"]   = _agent_key
+        st.session_state["_agent_tools"] = agent_tools
+        st.session_state["_react_agent"] = react_agent
+    else:
+        agent_tools = st.session_state["_agent_tools"]
+        react_agent = st.session_state["_react_agent"]
 
     # ── FEATURE 3: DRIVER WATCH LIST in sidebar ──────────────────────
     if not df_alarm.empty:
@@ -2254,14 +2264,20 @@ def main():
             # AI Weekly Summary (always visible)
             ai_weekly = None
             if llm:
-                with st.spinner("🤖 Generating weekly AI summary…"):
-                    trend_vals_12 = chart_data["per_bc"].round(3).tolist()
-                    depot_counts_w1 = w1_events["depot_id"].value_counts().to_dict() if not w1_events.empty and "depot_id" in w1_events.columns else {}
-                    ai_weekly = generate_weekly_summary(
-                        llm, alarm_choice, ALARM_MAP[alarm_choice]["long"],
-                        w1_week, w1_year, w1_metric, delta, w1_count, active_drv,
-                        json.dumps(trend_vals_12), json.dumps(depot_counts_w1),
-                    )
+                _t1_key = f"ai_weekly_{alarm_choice}_{w1_week}_{w1_year}_{depots_tuple}"
+                if st.session_state.get("_t1_key") != _t1_key:
+                    with st.spinner("🤖 Generating weekly AI summary…"):
+                        trend_vals_12 = chart_data["per_bc"].round(3).tolist()
+                        depot_counts_w1 = w1_events["depot_id"].value_counts().to_dict() if not w1_events.empty and "depot_id" in w1_events.columns else {}
+                        ai_weekly = generate_weekly_summary(
+                            llm, alarm_choice, ALARM_MAP[alarm_choice]["long"],
+                            w1_week, w1_year, w1_metric, delta, w1_count, active_drv,
+                            json.dumps(trend_vals_12), json.dumps(depot_counts_w1),
+                        )
+                        st.session_state["_t1_key"]     = _t1_key
+                        st.session_state["_t1_summary"] = ai_weekly
+                else:
+                    ai_weekly = st.session_state.get("_t1_summary")
 
             dir_word = "↑ up" if delta > 0 else "↓ down"
             if ai_weekly:
@@ -2413,21 +2429,27 @@ def main():
             # AI 4-week summary
             ai_4wk = None
             if llm:
-                with st.spinner("🤖 Generating 4-week pattern analysis…"):
-                    _rep_drivers, _rep_buses = {}, {}
-                    if not df_alarm.empty:
-                        for eid, grp in df_alarm[df_alarm["alarm_week"].isin(last4_weeks)].groupby("driver_id"):
-                            if grp["alarm_week"].nunique() >= 3:
-                                _rep_drivers[str(eid)] = int(len(grp))
-                        for eid, grp in df_alarm[df_alarm["alarm_week"].isin(last4_weeks)].groupby("bus_no"):
-                            if grp["alarm_week"].nunique() >= 3:
-                                _rep_buses[str(eid)] = int(len(grp))
-                    ai_4wk = generate_4week_summary(
-                        llm, alarm_choice, ALARM_MAP[alarm_choice]["long"],
-                        json.dumps(weeks_data), avg_4wk, trend_dir,
-                        json.dumps(dict(sorted(_rep_drivers.items(), key=lambda x: -x[1])[:5])),
-                        json.dumps(dict(sorted(_rep_buses.items(),   key=lambda x: -x[1])[:5])),
-                    )
+                _t2_key = f"ai_4wk_{alarm_choice}_{str(last4_weeks)}_{depots_tuple}"
+                if st.session_state.get("_t2_key") != _t2_key:
+                    with st.spinner("🤖 Generating 4-week pattern analysis…"):
+                        _rep_drivers, _rep_buses = {}, {}
+                        if not df_alarm.empty:
+                            for eid, grp in df_alarm[df_alarm["alarm_week"].isin(last4_weeks)].groupby("driver_id"):
+                                if grp["alarm_week"].nunique() >= 3:
+                                    _rep_drivers[str(eid)] = int(len(grp))
+                            for eid, grp in df_alarm[df_alarm["alarm_week"].isin(last4_weeks)].groupby("bus_no"):
+                                if grp["alarm_week"].nunique() >= 3:
+                                    _rep_buses[str(eid)] = int(len(grp))
+                        ai_4wk = generate_4week_summary(
+                            llm, alarm_choice, ALARM_MAP[alarm_choice]["long"],
+                            json.dumps(weeks_data), avg_4wk, trend_dir,
+                            json.dumps(dict(sorted(_rep_drivers.items(), key=lambda x: -x[1])[:5])),
+                            json.dumps(dict(sorted(_rep_buses.items(),   key=lambda x: -x[1])[:5])),
+                        )
+                        st.session_state["_t2_key"]     = _t2_key
+                        st.session_state["_t2_summary"] = ai_4wk
+                else:
+                    ai_4wk = st.session_state.get("_t2_summary")
 
             if ai_4wk:
                 box_style4 = "background:#f0fdf4;border-left:4px solid #16a34a;"
@@ -2542,19 +2564,25 @@ Use specific IDs and counts. Be direct and operational.""".strip())
                 next_wk = w1_week + 1 if w1_week < 52 else 1
                 ai_forecast = None
                 if llm:
-                    with st.spinner("🤖 Generating forecast analysis…"):
-                        trend_vals_f = weekly_sum.tail(12)["per_bc"].round(2).tolist()
-                        depot_stats_f = {}
-                        for dep in depots_tuple:
-                            d = df_alarm[df_alarm["depot_id"] == dep]
-                            if not d.empty:
-                                depot_stats_f[dep] = int(len(d[d["alarm_week"] == w1_week]))
-                        ai_forecast = generate_forecast_summary(
-                            llm, alarm_choice, ALARM_MAP[alarm_choice]["long"],
-                            w1_metric, proj_val,
-                            explainer.get("completion_rate", 0) * 100,
-                            json.dumps(trend_vals_f), json.dumps(depot_stats_f), next_wk,
-                        )
+                    _t3_key = f"ai_fcst_{alarm_choice}_{w1_week}_{w1_year}_{depots_tuple}"
+                    if st.session_state.get("_t3_key") != _t3_key:
+                        with st.spinner("🤖 Generating forecast analysis…"):
+                            trend_vals_f = weekly_sum.tail(12)["per_bc"].round(2).tolist()
+                            depot_stats_f = {}
+                            for dep in depots_tuple:
+                                d = df_alarm[df_alarm["depot_id"] == dep]
+                                if not d.empty:
+                                    depot_stats_f[dep] = int(len(d[d["alarm_week"] == w1_week]))
+                            ai_forecast = generate_forecast_summary(
+                                llm, alarm_choice, ALARM_MAP[alarm_choice]["long"],
+                                w1_metric, proj_val,
+                                explainer.get("completion_rate", 0) * 100,
+                                json.dumps(trend_vals_f), json.dumps(depot_stats_f), next_wk,
+                            )
+                            st.session_state["_t3_key"]      = _t3_key
+                            st.session_state["_t3_forecast"] = ai_forecast
+                    else:
+                        ai_forecast = st.session_state.get("_t3_forecast")
                 if ai_forecast:
                     fc_text  = ai_forecast; fc_style = "background:#fff7ed;border-left:4px solid #ea580c;"; fc_lstyle = "color:#c2410c;"
                 else:
@@ -2697,29 +2725,24 @@ Rules: state CRITICAL/ELEVATED/NORMAL, mention trend direction, identify primary
             if _t5_hc <= 0: _t5_hc = 1.0
 
             for a_type in ["HA","HB","HC"]:
-                # Use only_completed=False so current incomplete week is included in forecast
                 _df_f, _, _ = slice_by_filters(df_raw, weekly_all, depots_tuple, a_type, False, exclude_null)
 
-                # Step 1: Snap to report_date — no future records
-                _report_dt = pd.to_datetime(report_date)
-                _df_snap = _df_f[_df_f["alarm_date"] <= _report_dt] if not _df_f.empty else _df_f
-                if _df_snap.empty: continue
-
-                # Step 2: Determine the current week/year from report_date directly
-                # This is the authoritative "current week" — never inferred from data
+                # Snap to report_date AND cap at report_date's ISO week — removes stray future records
+                _report_dt  = pd.to_datetime(report_date)
                 _report_iso = _report_dt.isocalendar()
-                _lwk        = int(_report_iso.week)
-                _lwk_year   = int(_report_iso.year)
+                _cap_wk     = int(_report_iso.week)
+                _cap_yr     = int(_report_iso.year)
 
-                # Step 3: Filter _df_snap to ONLY weeks up to and including _lwk/_lwk_year
-                # This removes any stray future-week records that sneak past the date filter
-                _df_snap = _df_snap[
-                    (_df_snap["alarm_year"] < _lwk_year) |
-                    ((_df_snap["alarm_year"] == _lwk_year) & (_df_snap["alarm_week"] <= _lwk))
-                ]
+                _df_snap = _df_f[
+                    (_df_f["alarm_date"] <= _report_dt) &
+                    (
+                        (_df_f["alarm_year"] < _cap_yr) |
+                        ((_df_f["alarm_year"] == _cap_yr) & (_df_f["alarm_week"] <= _cap_wk))
+                    )
+                ] if not _df_f.empty else _df_f
                 if _df_snap.empty: continue
 
-                # Step 4: Rebuild per-week summary from the clean snapped data
+                # Rebuild weekly summary
                 _wk_s = (
                     _df_snap.groupby(["alarm_year","alarm_week"], as_index=False)
                     .size().rename(columns={"size":"alarm_sum"})
@@ -2732,17 +2755,17 @@ Rules: state CRITICAL/ELEVATED/NORMAL, mention trend direction, identify primary
                 _wk_s = _wk_s.sort_values("start_of_week")
                 if _wk_s.empty: continue
 
+                # _lwk comes directly from report_date — always correct
+                _lwk  = _cap_wk
                 _proj, _, _ = calculate_smart_forecast(_df_snap, _wk_s, _lwk, _t5_hc)
 
-                # Also compute the raw current-week rate (alarms so far / HC)
-                # Use whichever is higher — prevents blending logic from masking
-                # a progressing week that is already above threshold
-                _curr_wk_events = _df_snap[_df_snap["alarm_week"] == _lwk]
-                _raw_curr_rate  = len(_curr_wk_events) / _t5_hc if _t5_hc > 0 else 0.0
-                _effective_rate = max(_proj, _raw_curr_rate)
+                # Use max(projected, raw current rate) — ensures progressing week above 3.0 always shows
+                _curr_cnt      = len(_df_snap[_df_snap["alarm_week"] == _lwk])
+                _raw_rate      = _curr_cnt / _t5_hc if _t5_hc > 0 else 0.0
+                _effective     = max(_proj, _raw_rate)
 
-                if _effective_rate > 3.0:
-                    max_proj = max(max_proj, _effective_rate)
+                if _effective > 3.0:
+                    max_proj = max(max_proj, _effective)
                     curr  = _df_snap[_df_snap["alarm_week"] == _lwk]
                     top10 = (curr.groupby(["depot_id","svc_no","bus_no","model","driver_id"])
                              .size().sort_values(ascending=False).head(10).reset_index(name="count"))
@@ -2750,12 +2773,9 @@ Rules: state CRITICAL/ELEVATED/NORMAL, mention trend direction, identify primary
                         f"<tr><td>{r.depot_id}</td><td>{r.svc_no}</td><td>{r.bus_no}</td>"
                         f"<td>{r.model}</td><td>{r.driver_id}</td><td>{r['count']}</td></tr>"
                         for _, r in top10.iterrows())
-                    risk_label = "Medium Risk (>3.0)" if _effective_rate <= 5.0 else "Critical Risk (>5.0)"
-                    # Show projected rate if forecast > raw, else show raw with note
-                    _display_rate = _proj if _proj >= _raw_curr_rate else _raw_curr_rate
-                    _rate_note = " (projected)" if _proj >= _raw_curr_rate else " (current week rate — week in progress)"
+                    risk_label = "Medium Risk (>3.0)" if _effective <= 5.0 else "Critical Risk (>5.0)"
                     summaries.append(
-                        f"Projected value for end of the week ({a_type}): {_display_rate:.2f}{_rate_note} [{risk_label}]"
+                        f"Projected value for end of the week ({a_type}): {_effective:.2f} [{risk_label}]"
                     )
                     active_alerts.append(f"""
 <h3>Top Contributing Factors for {a_type}</h3>
@@ -2949,29 +2969,29 @@ Rules: state CRITICAL/ELEVATED/NORMAL, mention trend direction, identify primary
         if wt: fleet_rate = round(sum(w["rate_per_bc"] for w in wt) / len(wt), 3)
     except Exception: pass
 
+    # Build a compact context — only the most actionable data, not the full dump
+    _ctx_compact = {
+        "alarm_type":           ctx_data.get("alarm_type"),
+        "depots":               ctx_data.get("depots"),
+        "current_week":         ctx_data.get("current_week"),
+        "fleet_rate_per_trip":  ctx_data.get("fleet_rate_per_trip"),
+        "weekly_trend":         ctx_data.get("weekly_trend", [])[-8:],
+        "current_week_detail":  ctx_data.get("current_week_detail", {}),
+        "top_driver_rates":     dict(list(ctx_data.get("top_driver_rates", {}).items())[:8]),
+        "top_bus_rates":        dict(list(ctx_data.get("top_bus_rates", {}).items())[:8]),
+        "chronic_drivers":      ctx_data.get("chronic_drivers", {}),
+    }
     SYSTEM_PROMPT = f"""You are a world-class Fleet Operations Analyst embedded in a live bus telematics dashboard.
-You think like a domain expert with 15 years of bus fleet safety experience.
 
 === DOMAIN KNOWLEDGE ===
 Alarm types: HA=Harsh Acceleration | HB=Harsh Braking | HC=Harsh Cornering
-Thresholds: >5.0 alarms/BC = CRITICAL (red) | 3.0–5.0 = ELEVATED (amber) | <3.0 = NORMAL (green)
-BC = Bus Change (shift/trip unit). Fleet average this period: {fleet_rate:.3f}/BC
+Thresholds: >5.0/BC = CRITICAL | 3.0–5.0 = ELEVATED | <3.0 = NORMAL
+Fleet average: {fleet_rate:.3f}/BC
 
-Root cause decision tree:
-- High rate across 3+ buses → DRIVER-SPECIFIC → coaching
-- High rate across 3+ drivers → VEHICLE-SPECIFIC → sensor/maintenance inspection  
-- High rate on 1 service with many drivers → ROUTE-SPECIFIC → route audit
-- High rate fleet-wide with no single driver/bus pattern → FLEET-WIDE → training programme
-- High rate on <5 trips → INSUFFICIENT DATA → monitor 2 more weeks before action
+Root cause: High rate across 3+ buses → DRIVER coaching | 3+ drivers → VEHICLE inspection | 1 service many drivers → ROUTE audit | fleet-wide → TRAINING
 
-Anomaly flags:
-- Chronic offender: driver/bus present in top-10 for 3+ consecutive weeks
-- New entrant spike: entity not in top-10 last week, suddenly top-5 this week
-- Low-trip outlier: ≤5 trips but rate >2× fleet avg (statistically unreliable)
-- Model systematic: entire bus model above fleet avg → fleet-wide maintenance issue
-
-=== LIVE DATA SNAPSHOT ({alarm_choice} | {", ".join(depots)} | current week: W{w1_week}) ===
-{json.dumps(ctx_data, default=float, indent=2)}
+=== LIVE DATA ({alarm_choice} | W{w1_week} | {", ".join(depots)}) ===
+{json.dumps(_ctx_compact, default=float)}
 
 === CONVERSATION RULES ===
 1. ALWAYS cite specific numbers: driver IDs, bus numbers, exact alarm counts, exact rates.
@@ -3001,7 +3021,7 @@ Be direct, specific, and operational — no generic observations.
         messages = [{"role": "system", "content": SYSTEM_PROMPT}]
 
         # Include last 8 turns of conversation for memory
-        history_turns = chat_log[-16:]  # 8 user + 8 assistant
+        history_turns = chat_log[-8:]   # 4 user + 4 assistant — faster response
         for msg in history_turns:
             role    = msg["role"]
             content = msg["content"]
@@ -3026,7 +3046,7 @@ Be direct, specific, and operational — no generic observations.
                     model=llm._deployment,
                     messages=messages,
                     temperature=0.1,
-                    max_tokens=1800,
+                    max_tokens=1200,
                 )
                 return response.choices[0].message.content
             else:
