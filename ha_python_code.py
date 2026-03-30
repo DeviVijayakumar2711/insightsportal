@@ -224,7 +224,7 @@ except Exception:
 # CONFIG HELPERS
 # ─────────────────────────────────────────────
 def get_config(key, default=""):
-    """Read from env -> Streamlit secrets -> default. Works on Azure App Service."""
+    """Read from env → Streamlit secrets → default. Works on Azure App Service and locally."""
     val = os.environ.get(key)
     if val: return val.strip()
     try:
@@ -243,7 +243,7 @@ def _maybe_mtime(p: str) -> float:
     except: return 0.0
 
 def smart_read_csv(path_or_url: str, **kwargs) -> pd.DataFrame:
-    """Read CSV from local path or HTTP/SAS URL."""
+    """Read CSV from local path or HTTP/SAS URL (Azure Blob Storage)."""
     if not path_or_url: return pd.DataFrame()
     p = str(path_or_url).strip()
     if p.lower().startswith("http"):
@@ -367,6 +367,7 @@ def _file_accessible(p: str) -> bool:
     if str(p).lower().startswith("http"): return True
     return os.path.exists(str(p))
 
+@st.cache_data(show_spinner=False)
 def load_and_process_data(tele_file, excl_file, head_file, model_file, _mtime):
     df_raw   = smart_read_csv(tele_file)
     df_excl  = smart_read_csv(excl_file)  if _file_accessible(excl_file)  else pd.DataFrame()
@@ -1428,39 +1429,29 @@ AVAILABLE TOOLS:
 
 Tool names you can use: {tool_names}
 
-CRITICAL FORMAT RULES:
-1. After EVERY Thought: write EITHER "Action:" OR "Final Answer:" -- nothing else.
-2. Use "Final Answer:" as soon as you have enough information.
-3. Action must be one of the tool names listed above.
-4. Action Input must be on a single line immediately after Action:.
+CRITICAL FORMAT RULES — follow exactly or the parser will fail:
+1. After EVERY Thought: you MUST write EITHER "Action:" OR "Final Answer:" — nothing else.
+2. Never write a Thought: that ends without one of those two lines immediately following.
+3. Use "Final Answer:" as soon as you have enough information — do not keep looping.
+4. Action must be one of the tool names listed above — never invent a tool name.
+5. Action Input must be on a single line immediately after Action:.
 
 FORMAT:
 Question: {input}
-Thought: What dimensions do I need to investigate? What tools will give me evidence?
-Action: [one of {tool_names}]
-Action Input: [exact input]
-Observation: [tool result]
-Thought: What does this tell me? What else do I need?
-Action: [next tool]
-Action Input: [input]
+Thought: What tool do I need first?
+Action: top_offenders
+Action Input: driver
 Observation: [result]
-... (use up to 5 tools — use more for complex questions)
-Thought: I have multi-dimensional evidence. I can now give a definitive answer.
+Thought: I have the data I need. I can now answer.
 Final Answer:
-## [Question Answer Title]
-
-[Rich structured markdown with:]
-- Specific numbers for every claim
-- Bold for entity IDs and key metrics
-- Root cause classification with evidence
-- Comparison vs fleet average
-- Priority action table at the end
+## [Title]
+[Rich markdown answer with specific IDs, counts, rates, root cause, and action table]
 
 | Priority | Action | Target | Evidence |
 |----------|--------|--------|---------|
-| 1 | ... | ... | ... |
+| High | ... | ... | ... |
 
-Thought: {agent_scratchpad}"""
+{agent_scratchpad}"""
 
 def build_react_agent(llm, tools):
     if llm is None or not LANGCHAIN_OK or AgentExecutor is None: return None
@@ -1469,7 +1460,7 @@ def build_react_agent(llm, tools):
         agent    = create_react_agent(llm, tools, prompt)
         executor = AgentExecutor(
             agent=agent, tools=tools, verbose=False,
-            handle_parsing_errors="Format error: write Action: or Final Answer: after Thought.",
+            handle_parsing_errors="Format error — please write 'Action: <tool>' or 'Final Answer: <answer>' after your Thought.",
             max_iterations=3,
             max_execution_time=18,
             early_stopping_method="generate",
@@ -1477,7 +1468,7 @@ def build_react_agent(llm, tools):
         )
         return executor
     except Exception as e:
-        # Agent build failed silently -- fall through to Direct AI
+        # Agent build failed — fall through to Direct AI (Path 2)
         return None
 
 
@@ -2007,7 +1998,7 @@ def main():
         st.markdown("### 🚍 Control Panel")
 
         with st.expander("📂 Data Sources", expanded=False):
-            tele_file  = st.text_input("Telematics CSV",  _cfg("TELEMATICS_URL",  "telematics_leading_ind_13w.csv"))
+            tele_file  = st.text_input("Telematics CSV",  _cfg("TELEMATICS_URL",  "telematics_new_data_2207.csv"))
             excl_file  = st.text_input("Exclusions CSV",  _cfg("EXCLUSIONS_URL",  "vehicle_exclusions.csv"))
             head_file  = st.text_input("Headcounts CSV",  _cfg("HEADCOUNTS_URL",  "depot_headcounts.csv"))
             model_file = st.text_input("Bus Models CSV",  _cfg("MODEL_URL",        "model.csv"))
@@ -2069,8 +2060,6 @@ def main():
     df_alarm, week_map, weekly = slice_by_filters(
         df_raw, weekly_all, depots_tuple, alarm_choice, only_completed, exclude_null)
     weekly_sum, total_hc = per_week_kpis(weekly, headcounts, depots_tuple)
-
-    # agent block moved below week picker
 
     # ── FEATURE 3: DRIVER WATCH LIST in sidebar ──────────────────────
     if not df_alarm.empty:
@@ -2151,7 +2140,7 @@ def main():
     active_drv = df_alarm[df_alarm["alarm_week"]==w1_week]["driver_id"].nunique() if not df_alarm.empty else 0
     k4.metric("Drivers with Alarms",          f"{active_drv:,}")
 
-    # Agent -- cached in session_state, only rebuilds when alarm/depot/week changes
+    # Agent cached in session_state — w1_week and all vars now defined
     _agent_key = f"{alarm_choice}_{depots_tuple}_{w1_week}_{len(df_alarm)}"
     if st.session_state.get("_agent_key") != _agent_key or st.session_state.get("_agent_tools") is None:
         agent_tools = build_agent_tools(df_alarm, weekly_sum, total_hc, alarm_choice, df_raw, depots_tuple)
@@ -2737,7 +2726,7 @@ Rules: state CRITICAL/ELEVATED/NORMAL, mention trend direction, identify primary
             for a_type in ["HA","HB","HC"]:
                 _df_f, _, _ = slice_by_filters(df_raw, weekly_all, depots_tuple, a_type, False, exclude_null)
 
-                # Cap at report_date ISO week -- removes stray future-week records
+                # Snap to report_date AND cap at report_date's ISO week — removes stray future records
                 _report_dt  = pd.to_datetime(report_date)
                 _report_iso = _report_dt.isocalendar()
                 _cap_wk     = int(_report_iso.week)
@@ -2752,6 +2741,7 @@ Rules: state CRITICAL/ELEVATED/NORMAL, mention trend direction, identify primary
                 ] if not _df_f.empty else _df_f
                 if _df_snap.empty: continue
 
+                # Rebuild weekly summary
                 _wk_s = (
                     _df_snap.groupby(["alarm_year","alarm_week"], as_index=False)
                     .size().rename(columns={"size":"alarm_sum"})
@@ -2764,14 +2754,14 @@ Rules: state CRITICAL/ELEVATED/NORMAL, mention trend direction, identify primary
                 _wk_s = _wk_s.sort_values("start_of_week")
                 if _wk_s.empty: continue
 
-                # _lwk from report_date directly -- always correct, never inferred from data
+                # _lwk comes directly from report_date — always correct
                 _lwk  = _cap_wk
                 _proj, _, _ = calculate_smart_forecast(_df_snap, _wk_s, _lwk, _t5_hc)
 
-                # Use max(projected, raw rate) so progressing weeks above 3.0 always show
-                _curr_cnt = len(_df_snap[_df_snap["alarm_week"] == _lwk])
-                _raw_rate = _curr_cnt / _t5_hc if _t5_hc > 0 else 0.0
-                _effective = max(_proj, _raw_rate)
+                # Use max(projected, raw current rate) — ensures progressing week above 3.0 always shows
+                _curr_cnt      = len(_df_snap[_df_snap["alarm_week"] == _lwk])
+                _raw_rate      = _curr_cnt / _t5_hc if _t5_hc > 0 else 0.0
+                _effective     = max(_proj, _raw_rate)
 
                 if _effective > 3.0:
                     max_proj = max(max_proj, _effective)
@@ -2978,29 +2968,29 @@ Rules: state CRITICAL/ELEVATED/NORMAL, mention trend direction, identify primary
         if wt: fleet_rate = round(sum(w["rate_per_bc"] for w in wt) / len(wt), 3)
     except Exception: pass
 
+    # Build a compact context — only the most actionable data, not the full dump
+    _ctx_compact = {
+        "alarm_type":           ctx_data.get("alarm_type"),
+        "depots":               ctx_data.get("depots"),
+        "current_week":         ctx_data.get("current_week"),
+        "fleet_rate_per_trip":  ctx_data.get("fleet_rate_per_trip"),
+        "weekly_trend":         ctx_data.get("weekly_trend", [])[-8:],
+        "current_week_detail":  ctx_data.get("current_week_detail", {}),
+        "top_driver_rates":     dict(list(ctx_data.get("top_driver_rates", {}).items())[:8]),
+        "top_bus_rates":        dict(list(ctx_data.get("top_bus_rates", {}).items())[:8]),
+        "chronic_drivers":      ctx_data.get("chronic_drivers", {}),
+    }
     SYSTEM_PROMPT = f"""You are a world-class Fleet Operations Analyst embedded in a live bus telematics dashboard.
-You think like a domain expert with 15 years of bus fleet safety experience.
 
 === DOMAIN KNOWLEDGE ===
 Alarm types: HA=Harsh Acceleration | HB=Harsh Braking | HC=Harsh Cornering
-Thresholds: >5.0 alarms/BC = CRITICAL (red) | 3.0–5.0 = ELEVATED (amber) | <3.0 = NORMAL (green)
-BC = Bus Change (shift/trip unit). Fleet average this period: {fleet_rate:.3f}/BC
+Thresholds: >5.0/BC = CRITICAL | 3.0–5.0 = ELEVATED | <3.0 = NORMAL
+Fleet average: {fleet_rate:.3f}/BC
 
-Root cause decision tree:
-- High rate across 3+ buses → DRIVER-SPECIFIC → coaching
-- High rate across 3+ drivers → VEHICLE-SPECIFIC → sensor/maintenance inspection  
-- High rate on 1 service with many drivers → ROUTE-SPECIFIC → route audit
-- High rate fleet-wide with no single driver/bus pattern → FLEET-WIDE → training programme
-- High rate on <5 trips → INSUFFICIENT DATA → monitor 2 more weeks before action
+Root cause: High rate across 3+ buses → DRIVER coaching | 3+ drivers → VEHICLE inspection | 1 service many drivers → ROUTE audit | fleet-wide → TRAINING
 
-Anomaly flags:
-- Chronic offender: driver/bus present in top-10 for 3+ consecutive weeks
-- New entrant spike: entity not in top-10 last week, suddenly top-5 this week
-- Low-trip outlier: ≤5 trips but rate >2× fleet avg (statistically unreliable)
-- Model systematic: entire bus model above fleet avg → fleet-wide maintenance issue
-
-=== LIVE DATA SNAPSHOT ({alarm_choice} | {", ".join(depots)} | current week: W{w1_week}) ===
-{json.dumps(ctx_data, default=float, indent=2)}
+=== LIVE DATA ({alarm_choice} | W{w1_week} | {", ".join(depots)}) ===
+{json.dumps(_ctx_compact, default=float)}
 
 === CONVERSATION RULES ===
 1. ALWAYS cite specific numbers: driver IDs, bus numbers, exact alarm counts, exact rates.
@@ -3030,7 +3020,7 @@ Be direct, specific, and operational — no generic observations.
         messages = [{"role": "system", "content": SYSTEM_PROMPT}]
 
         # Include last 8 turns of conversation for memory
-        history_turns = chat_log[-8:]   # 4 user + 4 assistant
+        history_turns = chat_log[-8:]   # 4 user + 4 assistant — faster response
         for msg in history_turns:
             role    = msg["role"]
             content = msg["content"]
@@ -3103,9 +3093,13 @@ Be direct, specific, and operational — no generic observations.
                                 "alarm_choice": alarm_choice,
                                 "depots": ", ".join(depots),
                             })
-                            answer = result.get("output", "")
+                            raw_sq = result.get("output", "")
                             steps  = result.get("intermediate_steps", [])
-                            st.session_state.chat_steps[len(st.session_state.chat_log)] = steps
+                            _bad = ("agent stopped", "iteration limit", "time limit",
+                                    "format error", "invalid format", "parsing error")
+                            if raw_sq and not any(b in raw_sq.lower() for b in _bad):
+                                answer = raw_sq
+                                st.session_state.chat_steps[len(st.session_state.chat_log)] = steps
                         except Exception:
                             answer = None
                     if not answer and llm:
@@ -3174,11 +3168,17 @@ Be direct, specific, and operational — no generic observations.
                         "alarm_choice": alarm_choice,
                         "depots": ", ".join(depots),
                     })
-                    answer = result.get("output", "")
+                    raw_answer = result.get("output", "")
                     steps  = result.get("intermediate_steps", [])
-                    msg_idx = len(st.session_state.chat_log)
-                    st.session_state.chat_steps[msg_idx] = steps
-                except Exception as e:
+                    # Discard agent output if it's a failure message or empty
+                    _bad = ("agent stopped", "iteration limit", "time limit",
+                            "format error", "invalid format", "parsing error")
+                    if raw_answer and not any(b in raw_answer.lower() for b in _bad):
+                        answer = raw_answer
+                        msg_idx = len(st.session_state.chat_log)
+                        st.session_state.chat_steps[msg_idx] = steps
+                    # else: fall through to Path 2
+                except Exception:
                     answer = None  # fall through
 
             # ── Path 2: Direct AI with full context + conversation memory ──
